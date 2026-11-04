@@ -264,6 +264,121 @@ reveal_type(pl.scan_csv("data.csv", schema={"a": pl.Int64, "b": pl.String}, row_
 );
 
 polars_testcase!(
+    test_scan_parquet_explicit_schema,
+    r#"
+import polars as pl
+from typing import reveal_type
+
+reveal_type(pl.scan_parquet("data.parquet", schema={"a": pl.Int64, "b": pl.String}, hive_partitioning=False))  # E: revealed type: LazyFrame[a: Int64, b: String]
+reveal_type(pl.scan_parquet(source="data/", schema=pl.Schema({"a": pl.Int64, "b": pl.String}), hive_partitioning=False))  # E: revealed type: LazyFrame[a: Int64, b: String]
+reveal_type(pl.scan_parquet("data.parquet", schema={"a": pl.Int64, "b": pl.String}, hive_partitioning=False).collect())  # E: revealed type: DataFrame[a: Int64, b: String]
+reveal_type(pl.scan_parquet("data.parquet", schema={"a": pl.Int64}, row_index_name="idx", include_file_paths="path", hive_partitioning=False))  # E: revealed type: LazyFrame[idx: UInt32, a: Int64, path: String]
+reveal_type(pl.scan_parquet("data.parquet", schema={"a": pl.Int64}, hive_partitioning=False, cast_options=object()))  # E: revealed type: LazyFrame[a: Int64]
+"#,
+);
+
+// A directory source may hold Hive partitions whose columns are unknown statically.
+polars_testcase!(
+    test_scan_parquet_hive_partitions_make_schema_partial,
+    r#"
+import polars as pl
+from typing import reveal_type
+
+def f(flag: bool) -> None:
+    reveal_type(pl.scan_parquet("data/", schema={"a": pl.Int64}))  # E: revealed type: LazyFrame[a: Int64, ...]
+    reveal_type(pl.scan_parquet("data.parquet", schema={"a": pl.Int64}, hive_partitioning=None))  # E: revealed type: LazyFrame[a: Int64, ...]
+    reveal_type(pl.scan_parquet("data/", schema={"a": pl.Int64}, hive_partitioning=True))  # E: revealed type: LazyFrame[a: Int64, ...]
+    reveal_type(pl.scan_parquet("data/", schema={"a": pl.Int64}, hive_partitioning=flag))  # E: revealed type: LazyFrame[a: Int64, ...]
+    reveal_type(pl.scan_parquet("data/", schema={"a": pl.Int64}, row_index_name="idx", include_file_paths="path"))  # E: revealed type: LazyFrame[idx: UInt32, a: Int64, path: String, ...]
+"#,
+);
+
+polars_testcase!(
+    test_scan_parquet_no_static_schema_fallback,
+    r#"
+import polars as pl
+from typing import Any, reveal_type
+
+def f(schema: Any, options: dict[str, Any]) -> None:
+    reveal_type(pl.scan_parquet("data.parquet"))  # E: revealed type: LazyFrame
+    reveal_type(pl.scan_parquet("data.parquet", schema=schema))  # E: revealed type: LazyFrame
+    reveal_type(pl.scan_parquet("data.parquet", schema={"a": pl.Int64}, **options))  # E: revealed type: LazyFrame
+    reveal_type(pl.scan_parquet("data.parquet", schema={"a": pl.Int64}, include_file_paths="a"))  # E: revealed type: LazyFrame
+    reveal_type(pl.scan_parquet("data.parquet", schema={"a": pl.Int64}, row_index_name="a"))  # E: revealed type: LazyFrame
+    reveal_type(pl.scan_parquet("data.parquet", schema={"a": pl.Int64}, row_index_name="x", include_file_paths="x"))  # E: revealed type: LazyFrame
+"#,
+);
+
+polars_testcase!(
+    test_read_parquet_explicit_schema,
+    r#"
+import polars as pl
+from typing import reveal_type
+
+reveal_type(pl.read_parquet("data.parquet", schema={"a": pl.Int64, "b": pl.String}, hive_partitioning=False))  # E: revealed type: DataFrame[a: Int64, b: String]
+reveal_type(pl.read_parquet(source="data/", schema=pl.Schema({"a": pl.Int64, "b": pl.String}), hive_partitioning=False))  # E: revealed type: DataFrame[a: Int64, b: String]
+reveal_type(pl.read_parquet("data.parquet", schema={"a": pl.Int64}, row_index_name="idx", include_file_paths="path", hive_partitioning=False))  # E: revealed type: DataFrame[idx: UInt32, a: Int64, path: String]
+reveal_type(pl.read_parquet("data/", schema={"a": pl.Int64}))  # E: revealed type: DataFrame[a: Int64, ...]
+reveal_type(pl.read_parquet("data/", schema={"a": pl.Int64}, row_index_name="idx", include_file_paths="path"))  # E: revealed type: DataFrame[idx: UInt32, a: Int64, path: String, ...]
+reveal_type(pl.read_parquet("data/", schema={"a": pl.Int64}).lazy())  # E: revealed type: LazyFrame[a: Int64, ...]
+"#,
+);
+
+// A projection keeps only the listed columns, so it also drops Hive partition columns.
+polars_testcase!(
+    test_read_parquet_columns_present,
+    r#"
+import polars as pl
+from typing import reveal_type
+
+reveal_type(pl.read_parquet("data/", schema={"a": pl.Int64, "b": pl.Float64, "c": pl.String}, columns=["c", "a"]))  # E: revealed type: DataFrame[c: String, a: Int64]
+reveal_type(pl.read_parquet("data/", schema={"a": pl.Int64, "b": pl.Float64, "c": pl.String}, columns=[2, 0]))  # E: revealed type: DataFrame[c: String, a: Int64]
+reveal_type(pl.read_parquet("data/", schema={"a": pl.Int64, "b": pl.Float64, "c": pl.String}, columns=("b",), row_index_name="idx"))  # E: revealed type: DataFrame[idx: UInt32, b: Float64]
+reveal_type(pl.read_parquet("data/", schema={"a": pl.Int64}, columns=[]))  # E: revealed type: DataFrame[]
+reveal_type(pl.read_parquet("data/", schema={"a": pl.Int64}, columns=[], row_index_name="idx"))  # E: revealed type: DataFrame[idx: UInt32]
+reveal_type(pl.read_parquet("data/", schema={"a": pl.Int64}, columns=None))  # E: revealed type: DataFrame[a: Int64, ...]
+reveal_type(pl.read_parquet("data/", schema={"a": pl.Int64, "b": pl.String}, columns=["b"], hive_partitioning=False))  # E: revealed type: DataFrame[b: String]
+"#,
+);
+
+// The file path column appears only where the projection lists it.
+polars_testcase!(
+    test_read_parquet_columns_with_file_paths,
+    r#"
+import polars as pl
+from typing import reveal_type
+
+reveal_type(pl.read_parquet("data/", schema={"a": pl.Int64, "b": pl.String}, columns=["a"], include_file_paths="path"))  # E: revealed type: DataFrame[a: Int64]
+reveal_type(pl.read_parquet("data/", schema={"a": pl.Int64, "b": pl.String}, columns=["path", "a"], include_file_paths="path"))  # E: revealed type: DataFrame[path: String, a: Int64]
+reveal_type(pl.read_parquet("data/", schema={"a": pl.Int64, "b": pl.String}, columns=["a", "path"], include_file_paths="path", row_index_name="idx"))  # E: revealed type: DataFrame[idx: UInt32, a: Int64, path: String]
+reveal_type(pl.read_parquet("data/", schema={"a": pl.Int64, "b": pl.String}, columns=[1, 0], include_file_paths="path"))  # E: revealed type: DataFrame[b: String, a: Int64]
+reveal_type(pl.read_parquet("data/", schema={"a": pl.Int64}, columns=["path"]))  # E: revealed type: DataFrame
+reveal_type(pl.read_parquet("data/", schema={"a": pl.Int64}, columns=["a", "path"], include_file_paths="path", row_index_name="path"))  # E: revealed type: DataFrame
+"#,
+);
+
+polars_testcase!(
+    test_read_parquet_without_static_schema,
+    r#"
+import polars as pl
+from typing import Any, reveal_type
+
+def f(schema: Any, names: list[str]) -> None:
+    reveal_type(pl.read_parquet("data.parquet"))  # E: revealed type: DataFrame
+    reveal_type(pl.read_parquet("data.parquet", schema=schema))  # E: revealed type: DataFrame
+    reveal_type(pl.read_parquet("data.parquet", columns=["a"]))  # E: revealed type: DataFrame
+    reveal_type(pl.read_parquet("data.parquet", schema={"a": pl.Int64}, columns=names))  # E: revealed type: DataFrame
+    reveal_type(pl.read_parquet("data.parquet", schema={"a": pl.Int64}, columns=["z"]))  # E: revealed type: DataFrame
+    reveal_type(pl.read_parquet("data.parquet", schema={"a": pl.Int64}, columns=[1]))  # E: revealed type: DataFrame
+    reveal_type(pl.read_parquet("data.parquet", schema={"a": pl.Int64}, columns=[-1]))  # E: revealed type: DataFrame
+    reveal_type(pl.read_parquet("data.parquet", schema={"a": pl.Int64}, columns=["a", "a"]))  # E: revealed type: DataFrame
+    reveal_type(pl.read_parquet("data.parquet", schema={"a": pl.Int64}, columns=["a", 0]))  # E: revealed type: DataFrame
+    reveal_type(pl.read_parquet("data.parquet", schema={"a": pl.Int64}, row_index_name="a"))  # E: revealed type: DataFrame
+    reveal_type(pl.read_parquet("data.parquet", schema={"a": pl.Int64}, row_index_name="x", include_file_paths="x"))  # E: revealed type: DataFrame
+"#,
+);
+
+polars_testcase!(
     test_csv_none_options_are_absent,
     r#"
 import polars as pl
@@ -271,6 +386,19 @@ from typing import reveal_type
 
 reveal_type(pl.read_csv("data.csv", schema={"a": pl.Int64}, schema_overrides=None, columns=None, new_columns=None, row_index_name=None))  # E: revealed type: DataFrame[a: Int64]
 reveal_type(pl.scan_csv("data.csv", schema={"a": pl.Int64}, schema_overrides=None, new_columns=None, row_index_name=None, with_column_names=None, include_file_paths=None))  # E: revealed type: LazyFrame[a: Int64]
+"#,
+);
+
+polars_testcase!(
+    test_parquet_none_options_are_absent,
+    r#"
+import polars as pl
+from typing import reveal_type
+
+reveal_type(pl.read_parquet("data.parquet", schema={"a": pl.Int64}, columns=None, row_index_name=None, include_file_paths=None, hive_partitioning=False))  # E: revealed type: DataFrame[a: Int64]
+reveal_type(pl.read_parquet("data.parquet", schema={"a": pl.Int64}, columns=["a"], row_index_name=None, include_file_paths=None))  # E: revealed type: DataFrame[a: Int64]
+reveal_type(pl.scan_parquet("data.parquet", schema={"a": pl.Int64}, row_index_name=None, include_file_paths=None, hive_partitioning=False))  # E: revealed type: LazyFrame[a: Int64]
+reveal_type(pl.scan_parquet("data.parquet", schema={"a": pl.Int64}, row_index_name=None, include_file_paths=None, hive_partitioning=None))  # E: revealed type: LazyFrame[a: Int64, ...]
 "#,
 );
 
