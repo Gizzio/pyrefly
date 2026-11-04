@@ -8,6 +8,10 @@ from polars.functions.len import len as len
 from polars.functions.lit import lit as lit
 from polars.functions.whenthen import when as when
 from polars.io.csv.functions import read_csv as read_csv, scan_csv as scan_csv
+from polars.io.parquet.functions import (
+    read_parquet as read_parquet,
+    scan_parquet as scan_parquet,
+)
 from polars.lazyframe.frame import LazyFrame as LazyFrame
 from polars.schema import Schema as Schema
 from polars.series.series import Series as Series
