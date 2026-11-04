@@ -141,6 +141,7 @@ use crate::binding::binding::SuperStyle;
 use crate::binding::binding::TypeAliasParams;
 use crate::binding::binding::TypeParameter;
 use crate::binding::binding::UnpackedPosition;
+use crate::binding::bindings::UnsetNodeId;
 use crate::binding::narrow::FacetSubject;
 use crate::binding::narrow::NarrowOp;
 use crate::binding::narrow::identifier_and_chain_for_expr;
@@ -496,20 +497,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
     }
 
-    /// Solve a `BindingLegacyTypeParam`, producing a `LegacyTypeParameterLookup` that tells the
-    /// caller whether the name is a type parameter and, if so, which `Quantified` to use.
-    ///
-    /// The `scope_anchor` is the range of the `KeyLegacyTypeParam` key itself — the first
-    /// occurrence of the TypeVar name in this scope. It is unique per (scope, TypeVar) pair:
-    /// two functions that both use an imported `T` will have different first-occurrence ranges,
-    /// so their `Quantified`s will have different identities even though they share the same
-    /// module-level `TypeVar` declaration.
-    pub fn solve_legacy_tparam(
-        &self,
-        binding: &BindingLegacyTypeParam,
-        scope_anchor: TextRange,
-    ) -> LegacyTypeParameterLookup {
-        let maybe_parameter = match binding {
+    /// Resolve the original value before a possible legacy type parameter is quantified.
+    pub(crate) fn legacy_tparam_value(&self, binding: &BindingLegacyTypeParam) -> TypeInfo {
+        match binding {
             BindingLegacyTypeParam::ParamKeyed(k) => self.get_idx(*k).clone(),
             BindingLegacyTypeParam::ModuleKeyed(module) => {
                 // Errors in attribute lookup are reported elsewhere.
@@ -526,7 +516,23 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         )
                     })
             }
-        };
+        }
+    }
+
+    /// Solve a `BindingLegacyTypeParam`, producing a `LegacyTypeParameterLookup` that tells the
+    /// caller whether the name is a type parameter and, if so, which `Quantified` to use.
+    ///
+    /// The `scope_anchor` is the range of the `KeyLegacyTypeParam` key itself — the first
+    /// occurrence of the TypeVar name in this scope. It is unique per (scope, TypeVar) pair:
+    /// two functions that both use an imported `T` will have different first-occurrence ranges,
+    /// so their `Quantified`s will have different identities even though they share the same
+    /// module-level `TypeVar` declaration.
+    pub fn solve_legacy_tparam(
+        &self,
+        binding: &BindingLegacyTypeParam,
+        scope_anchor: TextRange,
+    ) -> LegacyTypeParameterLookup {
+        let maybe_parameter = self.legacy_tparam_value(binding);
         // Use the scope_anchor (the KeyLegacyTypeParam's own range, i.e. the first occurrence
         // of this TypeVar name in the enclosing function/class/alias scope) as the identity
         // anchor. This gives each (scope, TypeVar) pair a distinct Quantified even when multiple
@@ -713,6 +719,19 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     annotation: ann,
                 }
             }
+            BindingAnnotation::DocstringParam(name, x) => {
+                let silent = ErrorCollector::new(errors.module().dupe(), ErrorStyle::Delayed);
+                let annotation =
+                    self.expr_annotation(x, TypeFormContext::ParameterAnnotation, &silent);
+                AnnotationWithTarget {
+                    target: AnnotationTarget::Param(name.clone()),
+                    annotation: if silent.has_hard() {
+                        Annotation::default()
+                    } else {
+                        annotation
+                    },
+                }
+            }
             BindingAnnotation::SpecialForm(target, sf) => AnnotationWithTarget {
                 target: target.clone(),
                 annotation: Annotation::new_type(sf.to_type(self.heap)),
@@ -790,6 +809,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ty: Some(self.expr_infer(&x.slice, errors)),
                 }
             }
+            // Check subscripts as type forms so that misplaced qualifiers are reported.
+            Expr::Subscript(_) => Annotation::new_type(
+                self.expr_infer_impl(x, None, errors, Some(TypeFormContext::ClassKeyword))
+                    .into_ty(),
+            ),
             _ => Annotation::new_type(self.expr_infer(x, errors)),
         }
     }
@@ -2144,10 +2168,31 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         self.distribute_over_union(context_manager_type, |context_manager_type| {
             let context =
                 || ErrorContext::BadContextManager(self.for_display(context_manager_type.clone()));
-            let enter_type =
-                self.context_value_enter(context_manager_type, kind, range, errors, Some(&context));
-            let exit =
-                self.context_value_exit(context_manager_type, kind, range, errors, Some(&context));
+            // Collect each protocol half's errors separately: when both halves fail (e.g. an
+            // async context manager in a sync `with`), both would otherwise surface as
+            // identical-header `bad-context-manager` errors on the same range. The enter
+            // half's error wins, since it is the first protocol failure in reading order.
+            let enter_errors = ErrorCollector::new(errors.module().clone(), ErrorStyle::Delayed);
+            let enter_type = self.context_value_enter(
+                context_manager_type,
+                kind,
+                range,
+                &enter_errors,
+                Some(&context),
+            );
+            let exit_errors = ErrorCollector::new(errors.module().clone(), ErrorStyle::Delayed);
+            let exit = self.context_value_exit(
+                context_manager_type,
+                kind,
+                range,
+                &exit_errors,
+                Some(&context),
+            );
+            if !enter_errors.is_empty() {
+                errors.extend(enter_errors);
+            } else {
+                errors.extend(exit_errors);
+            }
             let exit_type = self.union(exit.with_exception, exit.without_exception);
             self.check_type(
                 &exit_type,
@@ -2771,6 +2816,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 operand,
                 ..
             }) => self.declared_bool_value(operand).map(|value| !value),
+            Expr::Named(named) => self.declared_bool_value(&named.value),
             Expr::BoolOp(ExprBoolOp { op, values, .. }) => {
                 // One `or` operand that is always true makes the whole test true, and one `and`
                 // operand that is always false makes it false. Otherwise the test is settled only
@@ -2792,6 +2838,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 // type, but the name always holds the assigned value, so that value's declaration
                 // settles it.
                 let idx = self.binding_before_narrowing(name);
+                if self.name_chosen_by_environment(name, idx) {
+                    return None;
+                }
                 match self.bindings().get(idx) {
                     Binding::FunctionParameter(param)
                         if matches!(**param, FunctionParameter::Annotated(_)) => {}
@@ -2811,6 +2860,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     | Binding::ClassDef(..)
                     | Binding::TypeAlias(_)
                     | Binding::AnnotatedType(..) => {}
+                    // Another module can reassign its variables, and tests patch them, so only a
+                    // `Final` with a declared type settles. Nothing reports rebinding the imported
+                    // name through `global`, so it also must not be declared `global`.
+                    Binding::Import(import)
+                        if !self.bindings().global_declarations().contains(&name.id)
+                            && self.export_settles(import.module, &import.name) => {}
                     // An unannotated assignment, a merge of several definitions, a capture, and
                     // the like all carry an inferred type.
                     _ => return None,
@@ -2819,10 +2874,29 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             }
             Expr::Attribute(attr) => {
                 let base = self.expr_infer(&attr.value, &swallow);
-                // Only a class or instance attribute can be looked up as a declaration. A module
-                // attribute is an unannotated global more often than not. A read through a
-                // descriptor returns what its `__get__` returns. An enum member's `value` is the
-                // type of the expression assigned to the member, which is inferred.
+                // A module attribute settles only if it is a `Final` with a declared type, as for
+                // an imported name, read from a module that the environment does not choose.
+                if let Type::Module(module) = &base {
+                    return (!self.module_chosen_by_environment(&attr.value)
+                        && self.export_settles(
+                            ModuleName::from_parts(module.parts()),
+                            &attr.attr.id,
+                        ))
+                    .then(|| {
+                        value_of_type(&self.attr_infer_for_type(
+                            &base,
+                            &attr.attr.id,
+                            attr.range,
+                            &swallow,
+                            None,
+                        ))
+                    })
+                    .flatten();
+                }
+                // Only a class or instance attribute can be looked up as a declaration. A read
+                // through a descriptor returns what its `__get__` returns. An enum member's
+                // `value` is the type of the expression assigned to the member, which is
+                // inferred.
                 let classes = self.attribute_lookup_classes(&base)?;
                 if matches!(attr.attr.id.as_str(), "value" | "_value_")
                     && classes
@@ -2852,6 +2926,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ))
             }
             Expr::Call(call) => {
+                if let Expr::Name(name) = &*call.func
+                    && self.name_chosen_by_environment(name, self.binding_before_narrowing(name))
+                {
+                    return None;
+                }
                 // Each member of a union is called separately, and an instance, including one
                 // whose type is a type variable, is called through its `__call__` method.
                 let mut callees = Vec::new();
@@ -3043,9 +3122,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             } => {
                 let ann_new = self.get_idx(*new);
                 let ann_existing = self.get_idx(*existing);
+                // Deferred alias references retain their defining identity. Compare annotations
+                // containing them with the solver's recursive equivalence check instead.
                 if let Some(t_new) = ann_new.ty(self.heap, self.stdlib)
                     && let Some(t_existing) = ann_existing.ty(self.heap, self.stdlib)
                     && t_new != t_existing
+                    && !((t_new.any(|ty| matches!(ty, Type::UntypedAlias(_)))
+                        || t_existing.any(|ty| matches!(ty, Type::UntypedAlias(_))))
+                        && self.is_equivalent(&t_new, &t_existing))
                 {
                     let t_new = self.for_display(t_new.clone());
                     let t_existing = self.for_display(t_existing.clone());
@@ -3091,7 +3175,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             } => self.check_match_exhaustiveness(
                 subject_idx,
                 narrowing_subject.as_ref(),
-                narrow_ops_for_fall_through,
+                narrow_ops_for_fall_through.as_ref(),
                 subject_range,
                 *show_subject_expr,
                 errors,
@@ -3100,11 +3184,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 subject_idx,
                 narrowing_subject,
                 narrow_ops_for_case,
+                prev_case_negations,
                 case_range,
             } => self.check_match_case_reachability(
                 subject_idx,
                 narrowing_subject.as_ref(),
-                narrow_ops_for_case,
+                narrow_ops_for_case.as_ref(),
+                prev_case_negations.as_deref(),
                 case_range,
                 errors,
             ),
@@ -3185,15 +3271,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             BindingExpect::UninitializedCheck {
                 name,
                 range,
-                termination_keys,
+                unset_nodes,
             } => {
-                // Check if all branches that appeared uninitialized at binding time
-                // actually terminate due to Never/NoReturn. If any don't terminate,
-                // the variable may be uninitialized at this use.
-                let all_terminate = termination_keys
-                    .iter()
-                    .all(|key| self.get_idx(*key).ty().is_never());
-                if !all_terminate {
+                if self.some_unset_path_continues(unset_nodes) {
                     errors
                         .error_builder(
                             *range,
@@ -3207,11 +3287,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 name,
                 range,
                 class,
-                termination_keys,
+                unset_nodes,
             } => {
-                let initialized = termination_keys
+                let initialized = unset_nodes
                     .as_ref()
-                    .is_some_and(|keys| keys.iter().all(|key| self.get_idx(*key).ty().is_never()));
+                    .is_some_and(|nodes| !self.some_unset_path_continues(nodes));
                 let inherited = !initialized
                     && self.get_idx(*class).0.as_ref().is_some_and(|cls| {
                         self.get_mro_for_class(cls)
@@ -3394,27 +3474,91 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
     }
 
+    /// Whether some class in `value_type` has a protected member `attr` that code enclosed by
+    /// the classes in `owners` cannot access.
+    fn is_protected_attribute_inaccessible(
+        &self,
+        attr: &Name,
+        value_type: &Type,
+        owners: &[Class],
+    ) -> bool {
+        value_type.clone().into_unions().into_iter().any(|ty| {
+            let accessed_class = match ty {
+                Type::ClassDef(cls) => Some(cls),
+                Type::ClassType(cls) | Type::SelfType(cls) => Some(cls.into_class_object()),
+                Type::Type(inner) => match *inner {
+                    Type::ClassType(cls) | Type::SelfType(cls) => Some(cls.into_class_object()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(accessed_class) = accessed_class else {
+                return false;
+            };
+            if matches!(
+                attr.as_str(),
+                "_asdict" | "_field_defaults" | "_fields" | "_make" | "_replace"
+            ) && self
+                .get_metadata_for_class(&accessed_class)
+                .named_tuple_metadata()
+                .is_some()
+            {
+                return false;
+            }
+            let Some(member) = self.get_class_member_with_defining_class(&accessed_class, attr)
+            else {
+                return false;
+            };
+            !member.defining_class.module_path().is_interface()
+                && !owners.iter().any(|owner| {
+                    member.defining_class == *owner
+                        || self
+                            .get_mro_for_class(owner)
+                            .ancestors_no_object()
+                            .iter()
+                            .any(|ancestor| ancestor.class_object() == &member.defining_class)
+                })
+        })
+    }
+
     fn check_private_attribute_access(
         &self,
         expect: &PrivateAttributeAccessCheck,
         errors: &ErrorCollector,
     ) {
         let value_type = self.expr_infer(&expect.value, errors);
-        // Name mangling only occurs on attributes of classes.
+        // Only class attributes are subject to access checks.
         if self.is_subset_eq(
             &value_type,
             &self.heap.mk_class_type(self.stdlib.module_type().clone()),
         ) {
             return;
         }
-        if let Some(class_idx) = expect.class_idx {
-            let class_binding = self.get_idx(class_idx);
-            let Some(owner) = class_binding.0.as_ref() else {
+        let Some(owners) = expect
+            .class_idxs
+            .iter()
+            .map(|class_idx| self.get_idx(*class_idx).0.clone())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return;
+        };
+        let (error_kind, message) = if Ast::is_protected_attr(&expect.attr.id) {
+            if !self.is_protected_attribute_inaccessible(&expect.attr.id, &value_type, &owners) {
                 return;
-            };
-            if self
-                .get_class_fields(owner)
-                .is_some_and(|f| f.contains(&expect.attr.id))
+            }
+            (
+                ErrorKind::ProtectedAccess,
+                format!(
+                    "Protected attribute `{}` cannot be accessed outside of its defining class or a subclass",
+                    expect.attr.id
+                ),
+            )
+        } else {
+            // Python mangles a private name using the innermost enclosing class.
+            if let Some(owner) = owners.first()
+                && self
+                    .get_class_fields(owner)
+                    .is_some_and(|f| f.contains(&expect.attr.id))
                 && self.is_subset_eq(
                     &value_type,
                     &self.union(
@@ -3423,24 +3567,21 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ),
                 )
             {
-                return; // Valid private attribute access
+                return;
             }
-        }
-        // No defining class to restrict access to — the attribute is only
-        // reachable via dynamic fallback (__getattr__/__getattribute__), so
-        // name mangling is irrelevant.
+            (
+                ErrorKind::NoAccess,
+                format!(
+                    "Private attribute `{}` cannot be accessed outside of its defining class",
+                    expect.attr.id
+                ),
+            )
+        };
+        // Dynamic fallback does not establish a class declaration to restrict access to.
         if !self.has_static_attr(&value_type, &expect.attr.id) {
             return;
         }
-        self.error(
-            errors,
-            expect.attr.range(),
-            ErrorKind::NoAccess,
-            format!(
-                "Private attribute `{}` cannot be accessed outside of its defining class",
-                expect.attr.id
-            ),
-        );
+        self.error(errors, expect.attr.range(), error_kind, message);
     }
 
     /// Populate parent methods map for find-references on reimplementations.
@@ -3861,16 +4002,24 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // with a narrower variance. We only check invariant TypeVars here
         // because wrong variance on covariant/contravariant TypeVars is
         // already caught by InvalidVariance at the usage site.
+        // Constraints often enumerate unrelated alternatives, making narrower-variance
+        // suggestions noisy. Explicit variance still matters for overlapping constraints
+        // and is validated above. This exemption intentionally differs from the
+        // constrained protocol case in protocols_variance.py.
         let metadata = self.get_metadata_for_class(class);
         if metadata.is_protocol()
-            && tparams
-                .as_vec()
-                .iter()
-                .any(|p| p.is_type_var() && p.variance() == PreInferenceVariance::Invariant)
+            && tparams.as_vec().iter().any(|p| {
+                p.is_type_var()
+                    && p.variance() == PreInferenceVariance::Invariant
+                    && !matches!(p.restriction(), Restriction::Constraints(_))
+            })
         {
             let inferred = self.infer_variance_ignoring_declared(class);
             for tparam in tparams.as_vec() {
-                if !tparam.is_type_var() || tparam.variance() != PreInferenceVariance::Invariant {
+                if !tparam.is_type_var()
+                    || tparam.variance() != PreInferenceVariance::Invariant
+                    || matches!(tparam.restriction(), Restriction::Constraints(_))
+                {
                     continue;
                 }
                 let inferred_v = inferred.get(tparam.name());
@@ -4330,7 +4479,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     /// Returns `None` for special forms which don't have a source expression.
     pub(crate) fn annotation_range(&self, key: Idx<KeyAnnotation>) -> Option<TextRange> {
         match self.bindings().get(key) {
-            BindingAnnotation::AnnotateExpr(_, expr, _) => Some(expr.range()),
+            BindingAnnotation::AnnotateExpr(_, expr, _)
+            | BindingAnnotation::DocstringParam(_, expr) => Some(expr.range()),
             BindingAnnotation::SpecialForm(..) => None,
         }
     }
@@ -5063,6 +5213,99 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 },
             }
         })
+    }
+
+    /// Whether another configuration may give the name, read through the definition `idx`, a
+    /// different value: the definition is in a suite of an `if` with a test of the environment and
+    /// the read is outside that suite, or a suite such a test rules out also defines the name.
+    fn name_chosen_by_environment(&self, name: &ExprName, idx: Idx<Key>) -> bool {
+        self.bindings()
+            .environment_definitions()
+            .get(&idx)
+            .is_some_and(|suite| !suite.contains_range(name.range))
+            || self.bindings().environment_names().contains(&name.id)
+    }
+
+    /// Whether a name another module exports can settle a branch test: it is `Final` with a
+    /// declared type, and no module on the way to it defines or imports it under a test of the
+    /// environment.
+    fn export_settles(&self, module: ModuleName, name: &Name) -> bool {
+        let origin = self.exports.export_origin(module, name);
+        origin.final_has_declared_type && !origin.defined_under_environment
+    }
+
+    /// Whether the expression that names a module may name another module under another
+    /// configuration: it is, or reads through, a name that a test of the environment defines or
+    /// imports, here or in the module it comes from, or a variable here or in another module. An
+    /// expression other than a name or a chain of attributes counts as chosen, since nothing
+    /// records how it was chosen.
+    fn module_chosen_by_environment(&self, x: &Expr) -> bool {
+        // An export that ends at a definition may hold whichever module an earlier test of the
+        // environment chose.
+        let export_chosen = |module: ModuleName, name: &Name| {
+            let origin = self.exports.export_origin(module, name);
+            origin.defined_under_environment || origin.ends_at_definition
+        };
+        match x {
+            Expr::Name(name) => {
+                let idx = self.binding_before_narrowing(name);
+                self.name_chosen_by_environment(name, idx)
+                    || self.bindings().global_declarations().contains(&name.id)
+                    || match self.bindings().get(idx) {
+                        Binding::Module(..) => false,
+                        Binding::Import(import) => export_chosen(import.module, &import.name),
+                        // An assignment or any other binding may hold whichever module an
+                        // earlier test of the environment chose.
+                        _ => true,
+                    }
+            }
+            Expr::Attribute(attr) => {
+                self.module_chosen_by_environment(&attr.value)
+                    || match self.expr_infer(&attr.value, &self.error_swallower()) {
+                        Type::Module(module) => {
+                            export_chosen(ModuleName::from_parts(module.parts()), &attr.attr.id)
+                        }
+                        _ => true,
+                    }
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether some path on which a name is unset continues past every merge it passes through,
+    /// through a branch that does not terminate due to Never/NoReturn. The nodes are the latest
+    /// merges on those paths.
+    fn some_unset_path_continues(&self, latest: &[UnsetNodeId]) -> bool {
+        let nodes = self.bindings().unset_nodes();
+        let mut reachable = SmallSet::new();
+        let mut stack = latest.to_vec();
+        while let Some(id) = stack.pop() {
+            if reachable.insert(id) {
+                stack.extend(nodes.get(id).previous.iter().copied());
+            }
+        }
+        // A path continues past a node if one of the node's keys is not `Never` and the path
+        // continued past one of the earlier nodes, unless the name became unset at this node.
+        // Earlier nodes have smaller ids, so visiting in id order decides them first.
+        let mut ids = reachable.into_iter().collect::<Vec<_>>();
+        ids.sort_unstable();
+        let mut continuing = SmallSet::new();
+        for id in ids {
+            let node = nodes.get(id);
+            if (node.previous.is_empty()
+                || node
+                    .previous
+                    .iter()
+                    .any(|previous| continuing.contains(previous)))
+                && node
+                    .keys
+                    .iter()
+                    .any(|key| !self.get_idx(*key).ty().is_never())
+            {
+                continuing.insert(id);
+            }
+        }
+        latest.iter().any(|id| continuing.contains(id))
     }
 
     /// Handle `Binding::ReturnImplicit` - compute the implicit return type.
@@ -5798,7 +6041,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         finalize(&annotation.target, self.heap.mk_any_implicit())
                     })
             }
-            FunctionParameter::Unannotated(function_idx, target, param_name) => {
+            FunctionParameter::Unannotated(function_idx, target, param_name, _) => {
                 // Get the resolved UndecoratedFunction - this ensures the function has been solved
                 // and resolved_param_types has been populated.
                 let undecorated = self.get_idx(*function_idx);
@@ -6520,7 +6763,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .map_ty(|ty| ty.promote_shallow_implicit_literals(self.stdlib))
     }
 
-    fn binding_to_type_info(&self, binding: &Binding, errors: &ErrorCollector) -> TypeInfo {
+    pub(crate) fn binding_to_type_info(
+        &self,
+        binding: &Binding,
+        errors: &ErrorCollector,
+    ) -> TypeInfo {
         match binding {
             Binding::Forward(k) | Binding::PatternCapture(k) => self.get_idx(*k).clone(),
             Binding::PromoteForward(k) => self.resolve_promote_forward(*k),

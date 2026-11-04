@@ -37,6 +37,7 @@ use crate::binding::attrs::collect_attrs_decorator_methods;
 use crate::binding::base_class::BaseClass;
 use crate::binding::base_class::BaseClassGeneric;
 use crate::binding::base_class::BaseClassGenericKind;
+use crate::binding::base_class::BaseClassSite;
 use crate::binding::binding::AnnotationTarget;
 use crate::binding::binding::Binding;
 use crate::binding::binding::BindingAbstractClassCheck;
@@ -75,6 +76,7 @@ use crate::binding::binding::KeyVariance;
 use crate::binding::bindings::BindingsBuilder;
 use crate::binding::bindings::CurrentIdx;
 use crate::binding::bindings::LegacyTParamCollector;
+use crate::binding::django::collect_django_queryset_only;
 use crate::binding::expr::Usage;
 use crate::binding::pydantic::PydanticConfigDict;
 use crate::binding::scope::ClassIndices;
@@ -360,7 +362,11 @@ impl<'a> BindingsBuilder<'a> {
                 },
             );
 
-            let base_class = self.base_class_of(base.clone());
+            let base_class = self.base_class_of(base.clone(), BaseClassSite::ClassStatement);
+            if matches!(base_class, BaseClass::Call(..)) {
+                self.call_base_classes
+                    .push((base.range(), class_indices.def_index));
+            }
             // NOTE(grievejia): If any of the class base is a specialized generic class (e.g. `Foo[Bar]`), and if the tparam of the
             // generic class has a bound or constraint, we won't be validating the type `Bar` against that bound/constraint of the
             // tparam eagerly in order to avoid dependency cycle. But the validation needs to happen somewhere.
@@ -373,7 +379,7 @@ impl<'a> BindingsBuilder<'a> {
             // usage tracking.
             if matches!(
                 base_class,
-                BaseClass::BaseClassExpr(..) | BaseClass::TypeOf(..)
+                BaseClass::BaseClassExpr(..) | BaseClass::Call(..) | BaseClass::TypeOf(..)
             ) {
                 self.insert_binding(
                     KeyExpect::TypeCheckBaseClassExpr(base.range()),
@@ -447,7 +453,9 @@ impl<'a> BindingsBuilder<'a> {
             class_indices.clone(),
             x.name.clone(),
             has_protocol_base,
+            docstring_range,
         ));
+        let previous_tracking = self.begin_classmethod_receivers(&body);
         // Record the class body range for solve-time `typing.Self` resolution.
         // We use the body extent (first..last stmt) — not `x.range` — so
         // bases, decorators, and type params (which are evaluated in the
@@ -457,13 +465,26 @@ impl<'a> BindingsBuilder<'a> {
             self.class_scopes
                 .push((body_range, class_indices.class_idx));
         }
+        let django_queryset_only = collect_django_queryset_only(&body);
         self.init_static_scope(&body, false);
         self.stmts(
             body,
             &NestingContext::class(ShortIdentifier::new(&x.name), parent.dupe()),
         );
-        let (field_definitions, nn_module_registrations, uninitialized_fields) =
+        self.finish_classmethod_receivers();
+        let (field_definitions, nn_module_registrations, uninitialized_fields, redefinitions) =
             self.scopes.finish_class_and_get_field_definitions();
+        for (name, new, existing) in redefinitions {
+            self.insert_binding(
+                KeyExpect::Redefinition(self.idx_to_key(new).range()),
+                BindingExpect::Redefinition {
+                    new,
+                    existing,
+                    name,
+                },
+            );
+        }
+        self.track_classmethod_uses = previous_tracking;
         self.insert_binding_idx(
             class_indices.synthesized_fields_idx,
             BindingClassSynthesizedFields {
@@ -502,7 +523,7 @@ impl<'a> BindingsBuilder<'a> {
 
             // Stub files declare attributes without runtime initialization.
             if !self.module_info.path().is_interface()
-                && let Some(termination_keys) = uninitialized_fields.get(name.key())
+                && let Some(unset_nodes) = uninitialized_fields.get(name.key())
             {
                 self.insert_binding(
                     KeyExpect::UninitializedAttributeCheck(range),
@@ -510,7 +531,7 @@ impl<'a> BindingsBuilder<'a> {
                         name: name.key().clone(),
                         range,
                         class: class_indices.class_idx,
-                        termination_keys: termination_keys.clone(),
+                        unset_nodes: unset_nodes.clone(),
                     },
                 );
             }
@@ -524,7 +545,8 @@ impl<'a> BindingsBuilder<'a> {
                     attrs_field_specifier,
                     range,
                     docstring_range,
-                ),
+                )
+                .with_django_queryset_only(django_queryset_only.get(name.key()).copied()),
             );
             let key_field = KeyClassField(class_indices.def_index, name.clone().into_key());
             let binding = BindingClassField {
@@ -1102,7 +1124,7 @@ impl<'a> BindingsBuilder<'a> {
     ) {
         let base_classes = base
             .into_iter()
-            .map(|base| self.base_class_of(base))
+            .map(|base| self.base_class_of(base, BaseClassSite::FunctionalForm))
             .chain(special_base)
             .collect::<Vec<_>>();
         let base_classes: Arc<[BaseClass]> = Arc::from(base_classes.into_boxed_slice());

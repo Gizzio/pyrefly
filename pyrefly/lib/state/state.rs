@@ -1113,7 +1113,7 @@ impl<'a> Transaction<'a> {
         self.get_load(handle).map(|x| x.module_info.dupe())
     }
 
-    /// Whether any other module depends on this one.
+    /// Return the modules that directly depend on this one.
     ///
     /// A dependency edge means the depending module's result was computed from
     /// this file's contents, which is exactly the question safe deletion asks,
@@ -1128,13 +1128,15 @@ impl<'a> Transaction<'a> {
     /// filesystem handle: as with `get_transitive_rdeps`, the rdeps of an
     /// in-memory handle contain only itself, which would make any file an IDE
     /// has open look unused.
-    pub fn is_depended_on_by_anything(&self, handle: &Handle) -> bool {
+    pub fn get_rdeps(&self, handle: &Handle) -> HashSet<Handle> {
         let path = handle.path().as_path();
         self.get_module(handle)
             .rdeps
             .lock()
             .iter()
-            .any(|rdep| rdep.path().as_path() != path)
+            .filter(|rdep| rdep.path().as_path() != path)
+            .cloned()
+            .collect()
     }
 
     /// Compute transitive dependency closure for the given handle.
@@ -1574,6 +1576,8 @@ impl<'a> Transaction<'a> {
                 legacy_overload_expansion: config
                     .legacy_overload_expansion(module_data.handle.path()),
                 treat_all_caps_as_final: config.treat_all_caps_as_final(module_data.handle.path()),
+                infer_param_types_from_docstring: config
+                    .infer_param_types_from_docstring(module_data.handle.path()),
                 recursion_limit_config: config.recursion_limit_config(),
                 pysa_context,
                 cinderx_enabled: self.data.cinderx_reporter.is_some(),
@@ -2668,6 +2672,8 @@ impl<'a> Transaction<'a> {
                 spec_compliant_overloads: config.spec_compliant_overloads(m.handle.path()),
                 legacy_overload_expansion: config.legacy_overload_expansion(m.handle.path()),
                 treat_all_caps_as_final: config.treat_all_caps_as_final(m.handle.path()),
+                infer_param_types_from_docstring: config
+                    .infer_param_types_from_docstring(m.handle.path()),
                 recursion_limit_config: config.recursion_limit_config(),
                 pysa_context: None,
                 cinderx_enabled: false,
@@ -2747,6 +2753,13 @@ impl<'a> Transaction<'a> {
         let module_data = self.get_module(handle);
         self.lookup_export(module_data)
             .exports(&self.lookup(module_data))
+    }
+
+    /// Names available through a wildcard import, respecting the module's `__all__`.
+    pub(crate) fn get_wildcard_exports(&self, handle: &Handle) -> Arc<SmallSet<Name>> {
+        let module_data = self.get_module(handle);
+        self.lookup_export(module_data)
+            .wildcard(&self.lookup(module_data))
     }
 
     pub(crate) fn builtin_module_for_name(
@@ -3032,8 +3045,7 @@ impl Drop for TransactionHandle<'_> {
 
 /// One step of a walk along a chain of re-exports, as seen from a single module.
 enum ExportStep<T> {
-    /// The chain ends at a definition in this module, carrying the value read
-    /// off its `Export`.
+    /// The chain ends in this module, carrying the value read off it.
     Resolved(T),
     /// The name is re-exported from another module, under the given name if the
     /// re-export renamed it.
@@ -3054,6 +3066,14 @@ impl<'a> LookupExport for TransactionHandle<'a> {
         self.with_exports(
             module,
             |exports, lookup| exports.wildcard(lookup),
+            ModuleDep::Wildcard,
+        )
+    }
+
+    fn get_environment_wildcard(&self, module: ModuleName) -> Option<Arc<SmallSet<Name>>> {
+        self.with_exports(
+            module,
+            |exports, lookup| exports.environment_wildcard(lookup),
             ModuleDep::Wildcard,
         )
     }
@@ -3211,32 +3231,45 @@ impl<'a> LookupExport for TransactionHandle<'a> {
     fn export_origin(&self, mut module: ModuleName, name: &Name) -> ExportOrigin {
         let mut seen = HashSet::new();
         let mut name = name.clone();
+        let mut under_environment = false;
 
-        let is_final = loop {
+        // The finality of the definition the chain ends at, if it ends at one.
+        let definition = loop {
             // A chain may pass through a module more than once under different
             // names, so only a repeated (module, name) pair is a real cycle.
             if !seen.insert((module, name.clone())) {
-                break false;
+                break None;
             }
 
-            let next = self
+            let (next, defined_under_environment) = self
                 .with_exports(
                     module,
-                    |exports, lookup| match exports.exports(lookup).get(&name) {
-                        Some(ExportLocation::ThisModule(Export { is_final, .. })) => {
-                            ExportStep::Resolved(*is_final)
-                        }
-                        Some(ExportLocation::OtherModule(other_module, original_name)) => {
-                            ExportStep::Redirect(*other_module, original_name.clone())
-                        }
-                        None => ExportStep::Resolved(false),
+                    |exports, lookup| {
+                        let under_environment =
+                            exports.environment_wildcard(lookup).contains(&name);
+                        let step = match exports.exports(lookup).get(&name) {
+                            // The name is the imported module itself, not a name inside it.
+                            _ if exports.imports_module(&name) => ExportStep::Resolved(None),
+                            Some(ExportLocation::ThisModule(Export { is_final, .. })) => {
+                                ExportStep::Resolved(Some((
+                                    *is_final,
+                                    exports.final_has_declared_type(&name),
+                                )))
+                            }
+                            Some(ExportLocation::OtherModule(other_module, original_name)) => {
+                                ExportStep::Redirect(*other_module, original_name.clone())
+                            }
+                            None => ExportStep::Resolved(None),
+                        };
+                        (step, under_environment)
                     },
                     ModuleDep::ExportOrigin(name.clone()),
                 )
-                .unwrap_or(ExportStep::Resolved(false));
+                .unwrap_or((ExportStep::Resolved(None), false));
+            under_environment |= defined_under_environment;
 
             match next {
-                ExportStep::Resolved(is_final) => break is_final,
+                ExportStep::Resolved(definition) => break definition,
                 ExportStep::Redirect(other_module, original_name) => {
                     if let Some(original_name) = original_name {
                         name = original_name;
@@ -3248,7 +3281,10 @@ impl<'a> LookupExport for TransactionHandle<'a> {
 
         ExportOrigin {
             origin: (module, name),
-            is_final,
+            is_final: definition.is_some_and(|(is_final, _)| is_final),
+            final_has_declared_type: definition.is_some_and(|(_, declared)| declared),
+            ends_at_definition: definition.is_some(),
+            defined_under_environment: under_environment,
         }
     }
 }

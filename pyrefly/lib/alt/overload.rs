@@ -44,6 +44,8 @@ use crate::alt::unwrap::HintRef;
 use crate::config::error_kind::ErrorKind;
 use crate::error::collector::ErrorCollector;
 use crate::error::context::ErrorContext;
+use crate::error::error::ContextManagerKind;
+use crate::error::error::ErrorQuickFix;
 use crate::solver::solver::ArgumentKey;
 use crate::solver::solver::OverloadTable;
 use crate::solver::solver::TypeVarSpecializationError;
@@ -51,6 +53,7 @@ use crate::types::callable::Callable;
 use crate::types::callable::Params;
 use crate::types::function::FuncMetadata;
 use crate::types::function::Function;
+use crate::types::function::FunctionKind;
 use crate::types::literal::Lit;
 use crate::types::quantified::Quantified;
 use crate::types::type_var::Restriction;
@@ -197,18 +200,12 @@ impl<'a, Ans: LookupAnswer> ArgsExpander<'a, Ans> {
                     Lit::Bool(false).to_implicit_type(),
                 ]
             }
-            Type::ClassType(cls)
-                if self
-                    .solver
-                    .get_metadata_for_class(cls.class_object())
-                    .is_enum() =>
-            {
-                self.solver
-                    .get_enum_members(cls.class_object())
-                    .into_iter()
-                    .map(Lit::to_implicit_type)
-                    .collect()
-            }
+            Type::ClassType(cls) if self.solver.is_expandable_enum(cls.class_object()) => self
+                .solver
+                .get_enum_members(cls.class_object())
+                .into_iter()
+                .map(Lit::to_implicit_type)
+                .collect(),
             Type::Type(f) if matches!(&*f, Type::Union(_)) => {
                 // Repeated match because pattern guards cannot move out of bindings.
                 let Type::Union(u) = *f else {
@@ -515,6 +512,20 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     errors.error_builder(arguments_range, ErrorKind::Deprecated, header);
                 if let Some(detail) = detail {
                     error_builder = error_builder.with_detail(detail);
+                }
+                if let FunctionKind::Def(id) = &closest_overload.func.1.metadata.kind {
+                    let replacement = if id.has_toplevel_qname("contextlib", "contextmanager") {
+                        Some(ContextManagerKind::Sync)
+                    } else if id.has_toplevel_qname("contextlib", "asynccontextmanager") {
+                        Some(ContextManagerKind::Async)
+                    } else {
+                        None
+                    };
+                    if let Some(kind) = replacement {
+                        error_builder = error_builder.with_quick_fix(
+                            ErrorQuickFix::ReplaceDeprecatedContextManagerReturn(kind),
+                        );
+                    }
                 }
                 error_builder.with_context(context).emit();
             }

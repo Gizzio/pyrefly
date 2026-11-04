@@ -19,7 +19,6 @@ use pyrefly_python::dunder;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::nesting_context::NestingContext;
 use pyrefly_python::short_identifier::ShortIdentifier;
-use pyrefly_types::data_frame::DataFrameKind;
 use pyrefly_types::dimension::Int;
 use pyrefly_types::dimension::canonicalize;
 use pyrefly_types::dimension::gradual_size;
@@ -94,14 +93,13 @@ use crate::alt::call::CallStyle;
 use crate::alt::callable::CallArg;
 use crate::alt::class::typed_dict::TypedDictErrorKind;
 use crate::alt::nn_module_specials::is_nn_module_dict;
-use crate::alt::polars_specials::is_polars_series;
+use crate::alt::polars_specials::is_polars_api_series;
 use crate::alt::regex::RegexValidationError;
 use crate::alt::regex::validate_pattern;
 use crate::alt::shape_extension::is_int_tuple_bound;
 use crate::alt::solve::TypeFormContext;
 use crate::alt::solve::UntypeContext;
 use crate::alt::unwrap::HintRef;
-use crate::alt::unwrap::ListElementHint;
 use crate::binding::binding::Binding;
 use crate::binding::binding::BindingClass;
 use crate::binding::binding::Key;
@@ -147,9 +145,15 @@ pub enum TypeOrExpr<'a> {
     Expr(&'a Expr),
 }
 
-pub(crate) enum PreparedExprCall {
+pub(crate) enum PreparedExprCall<'a> {
     Resolved(Type),
-    Callee(Type),
+    Callee(ExprCallee<'a>),
+}
+
+#[derive(Debug, Clone)]
+pub struct ExprCallee<'a> {
+    pub ty: Type,
+    pub expr: &'a ExprCall,
 }
 
 /// Where a dimension expression appears, which controls whether a plain
@@ -905,8 +909,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         errors: &ErrorCollector,
         type_form_context: Option<TypeFormContext<'_>>,
     ) -> TypeInfo {
-        // The value of an assignment expression is checked separately.
-        let mut check_deprecation = !matches!(x, Expr::Named(..));
+        // Assignment values and branches of conditional and boolean expressions are checked separately.
+        let mut check_deprecation = !matches!(x, Expr::Named(..) | Expr::If(..) | Expr::BoolOp(..));
         let res = match x {
             Expr::Name(x) => {
                 if Ast::is_synthesized_empty_name(x) {
@@ -942,13 +946,32 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         // already been checked.
                         check_deprecation = false;
                     }
-                    self.subscript_infer(
-                        &base,
-                        &x.slice,
-                        x.range(),
-                        type_form_context.unwrap_or(TypeFormContext::TypeExpression),
-                        errors,
-                    )
+                    // A qualifier like `NotRequired[int]` is a legal runtime value, which
+                    // typeshed types as `object`.
+                    if type_form_context.is_none()
+                        && let Type::Type(inner) = base.ty()
+                        && matches!(
+                            **inner,
+                            Type::SpecialForm(
+                                SpecialForm::ClassVar
+                                    | SpecialForm::Final
+                                    | SpecialForm::ReadOnly
+                                    | SpecialForm::Required
+                                    | SpecialForm::NotRequired
+                            )
+                        )
+                    {
+                        self.expr_infer(&x.slice, errors);
+                        TypeInfo::of_ty(self.heap.mk_class_type(self.stdlib.object().clone()))
+                    } else {
+                        self.subscript_infer(
+                            &base,
+                            &x.slice,
+                            x.range(),
+                            type_form_context.unwrap_or(TypeFormContext::TypeExpression),
+                            errors,
+                        )
+                    }
                 }
             }
             Expr::Named(x) => match &*x.target {
@@ -1059,6 +1082,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     errors,
                     errors,
                     |cur_hint, callable_errors, _| {
+                        let _lambda_context = self.enter_lambda_binding_context(
+                            param_ids
+                                .iter()
+                                .map(|(_, id)| *id)
+                                .chain(vararg.map(|(_, id)| id))
+                                .chain(kwarg.map(|(_, id)| id)),
+                        );
                         let implicit_any = |name: &Name, range: TextRange| {
                             self.error(
                                 callable_errors,
@@ -1255,9 +1285,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 hint,
                 |hint| self.decompose_list(hint),
                 |elem_hint, hint| {
-                    let (elem_hint, partial_fallback) = elem_hint
-                        .map(ListElementHint::into_parts)
-                        .unwrap_or_default();
                     self.ifs_infer(&x.generators, errors);
                     let elem_ty = self.expr_infer_with_hint_promote(
                         &x.elt,
@@ -1265,13 +1292,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         errors,
                         HintCoercion::BestEffort,
                     );
-                    let ty = self.heap.mk_class_type(self.stdlib.list(elem_ty));
-                    if let Some(partial_fallback) = partial_fallback {
-                        self.solver()
-                            .replace_unresolved_partials(ty, &partial_fallback)
-                    } else {
-                        ty
-                    }
+                    self.heap.mk_class_type(self.stdlib.list(elem_ty))
                 },
             ),
             Expr::SetComp(x) => self.infer_with_decomposed_hint(
@@ -1290,14 +1311,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             ),
             Expr::DictComp(x) => self.infer_with_decomposed_hint(
                 hint,
-                |hint| {
-                    let (key_hint, value_hint) = self.decompose_dict(hint);
-                    if key_hint.is_none() && value_hint.is_none() {
-                        None
-                    } else {
-                        Some((key_hint, value_hint))
-                    }
-                },
+                |hint| self.decompose_dict(hint),
                 |decomposed_hints, hint| {
                     let (key_hint, value_hint) = decomposed_hints.unwrap_or_default();
                     let key_hint = key_hint.as_ref().and_then(|key_hint| {
@@ -1386,7 +1400,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     }
                 }
                 let prepared = self.prepare_expr_call(x, errors);
-                self.finish_prepared_expr_call(x, prepared, hint, errors)
+                self.finish_prepared_expr_call(prepared, hint, errors)
             }
             Expr::FString(x) => {
                 let mut all_literal_strings = true;
@@ -1478,11 +1492,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
     }
 
-    pub(crate) fn prepare_expr_call(
+    pub(crate) fn prepare_expr_call<'a>(
         &self,
-        x: &ExprCall,
+        x: &'a ExprCall,
         errors: &ErrorCollector,
-    ) -> PreparedExprCall {
+    ) -> PreparedExprCall<'a> {
         if let Some(ty) = self.synthesized_functional_class_type(x) {
             return PreparedExprCall::Resolved(ty);
         }
@@ -1501,17 +1515,19 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         } else {
             self.expr_infer(&x.func, errors)
         };
-        PreparedExprCall::Callee(callee_ty)
+        PreparedExprCall::Callee(ExprCallee {
+            ty: callee_ty,
+            expr: x,
+        })
     }
 
     pub(crate) fn finish_prepared_expr_call(
         &self,
-        x: &ExprCall,
         prepared: PreparedExprCall,
         hint: Option<HintRef>,
         errors: &ErrorCollector,
     ) -> Type {
-        let mut callee_ty = match prepared {
+        let mut callee = match prepared {
             PreparedExprCall::Resolved(ty) => return ty,
             PreparedExprCall::Callee(callee_ty) => callee_ty,
         };
@@ -1519,47 +1535,50 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // Instantiating a subscripted generic whose type argument is an out-of-scope legacy
         // TypeVar (e.g. `list[T]()` at module scope) is an error: `T` is not bound by any
         // enclosing generic scope. Only subscript callees can introduce such a raw TypeVar.
-        if matches!(&*x.func, Expr::Subscript(_)) {
-            self.check_legacy_typevar_scoping(&mut callee_ty, x.func.range(), errors);
+        if matches!(&*callee.expr.func, Expr::Subscript(_)) {
+            self.quantify_call_base_legacy_typevars(&mut callee.ty, callee.expr.func.range());
+            self.check_legacy_typevar_scoping(&mut callee.ty, callee.expr.func.range(), errors);
         }
 
-        self.check_pytorch_tensor_item_call(x, &callee_ty, errors);
-        self.check_pytorch_tensor_cuda_call(x, &callee_ty, errors);
-        self.check_pytorch_print_tensor(x, &callee_ty, errors);
-        self.check_pytorch_redundant_to_call(x, &callee_ty, errors);
-        self.check_sqlalchemy_update_values_call(x, errors);
-        if let Some(d) = self.call_to_dict(&callee_ty, &x.arguments) {
-            self.dict_infer(&d, hint, x.range(), errors)
+        self.check_pytorch_tensor_item_call(callee.expr, &callee.ty, errors);
+        self.check_pytorch_tensor_cuda_call(callee.expr, &callee.ty, errors);
+        self.check_pytorch_print_tensor(callee.expr, &callee.ty, errors);
+        self.check_pytorch_redundant_to_call(callee.expr, &callee.ty, errors);
+        self.check_sqlalchemy_keyword_call(callee.expr, errors);
+        if let Some(d) = self.call_to_dict(&callee.ty, &callee.expr.arguments) {
+            self.dict_infer(&d, hint, callee.expr.range(), errors)
         } else if let Some(ty) = self
             .anonymous_typed_dict_get_or_setdefault_with_literal(
-                &x.func,
-                &x.arguments,
+                &callee.expr.func,
+                &callee.expr.arguments,
                 "get",
                 errors,
             )
             .or_else(|| {
                 self.anonymous_typed_dict_get_or_setdefault_with_literal(
-                    &x.func,
-                    &x.arguments,
+                    &callee.expr.func,
+                    &callee.expr.arguments,
                     "setdefault",
                     errors,
                 )
             })
         {
             ty
-        } else if let Some(ty) =
-            self.anonymous_typed_dict_pop_with_literal(&x.func, &x.arguments, errors)
-        {
+        } else if let Some(ty) = self.anonymous_typed_dict_pop_with_literal(
+            &callee.expr.func,
+            &callee.expr.arguments,
+            errors,
+        ) {
             ty
         } else if let Some((obj_ty, key_expr, key)) =
-            self.is_dict_get_with_literal(&x.func, &x.arguments, errors)
+            self.is_dict_get_with_literal(&callee.expr.func, &callee.expr.arguments, errors)
         {
             let facet = FacetKind::Key(key.to_string());
             if obj_ty.has_value_less_presence(&facet) {
                 self.subscript_infer_for_type_with_key_present(
                     obj_ty.ty(),
                     key_expr,
-                    x.range(),
+                    callee.expr.range(),
                     errors,
                     true,
                     TypeFormContext::TypeExpression,
@@ -1567,19 +1586,23 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             } else {
                 obj_ty
                     .at_facet(&facet, || {
-                        self.expr_call_infer(x, callee_ty.clone(), hint, errors)
+                        self.expr_call_infer(callee.clone(), hint, errors)
                     })
                     .into_ty()
             }
         } else {
-            let regex_pattern = Self::regex_pattern_argument(&x.arguments);
+            let regex_pattern = Self::regex_pattern_argument(&callee.expr.arguments);
             let regex_flags_position =
-                regex_pattern.and_then(|_| self.regex_flags_position(&callee_ty));
-            let ret = self.expr_call_infer(x, callee_ty, hint, errors);
+                regex_pattern.and_then(|_| self.regex_flags_position(&callee.ty));
             if let (Some(pattern), Some(flags_position)) = (regex_pattern, regex_flags_position) {
-                self.regex_validate_pattern_argument(pattern, &x.arguments, flags_position, errors);
+                self.regex_validate_pattern_argument(
+                    pattern,
+                    &callee.expr.arguments,
+                    flags_position,
+                    errors,
+                );
             }
-            ret
+            self.expr_call_infer(callee, hint, errors)
         }
     }
 
@@ -1647,6 +1670,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     /// Report references to deprecated classes, functions, and methods.
     fn check_for_deprecated_call(&self, ty: &Type, range: TextRange, errors: &ErrorCollector) {
+        if let Type::Union(union) = ty {
+            for member in &union.members {
+                self.check_for_deprecated_call(member, range, errors);
+            }
+            return;
+        }
         if ty.property_metadata().is_some() {
             // This prevents misfiring deprecation warnings on property setters and deleters.
             return;
@@ -1899,185 +1928,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                  For example: `torch.{factory_name}(..., device=device)`"
             ))
             .emit();
-    }
-
-    /// Validate `sqlalchemy.update(Model).values(field=...)` keyword arguments against the
-    /// `Mapped[...]` fields declared on `Model`.
-    fn check_sqlalchemy_update_values_call(&self, x: &ExprCall, errors: &ErrorCollector) {
-        let Expr::Attribute(attr_expr) = &*x.func else {
-            return;
-        };
-        if attr_expr.attr.id.as_str() != "values" {
-            return;
-        }
-        let Some(model) = self.sqlalchemy_update_model_from_chain(&attr_expr.value) else {
-            return;
-        };
-        let mapped_fields = self.sqlalchemy_mapped_model_fields(&model);
-        if mapped_fields.is_empty() {
-            return;
-        }
-        for keyword in &x.arguments.keywords {
-            let Some(field_identifier) = keyword.arg.as_ref() else {
-                continue;
-            };
-            let field_name = &field_identifier.id;
-            if mapped_fields.contains(field_name) {
-                let expected_ty = self.sqlalchemy_mapped_field_type(&model, field_name);
-                let got_ty = self.expr_infer(&keyword.value, errors);
-                if !self.is_subset_eq(&got_ty, &expected_ty)
-                    && !Self::is_sqlalchemy_owned_type(&got_ty)
-                {
-                    self.error(
-                        errors,
-                        keyword.value.range(),
-                        ErrorKind::BadArgumentType,
-                        format!(
-                            "`{}` is not assignable to field `{field_name}` with type `{}`",
-                            self.for_display(got_ty),
-                            self.for_display(expected_ty)
-                        ),
-                    );
-                }
-            } else {
-                let mut builder = errors.error_builder(
-                    field_identifier.range(),
-                    ErrorKind::UnexpectedKeyword,
-                    format!("Unexpected SQLAlchemy update field `{field_name}`"),
-                );
-                if let Some(suggestion) = best_suggestion(
-                    field_name,
-                    mapped_fields
-                        .iter()
-                        .map(|candidate| Candidate::measured(candidate, 0)),
-                ) {
-                    builder = builder.with_detail(format!("Did you mean `{suggestion}`?"));
-                }
-                builder.emit();
-            }
-        }
-    }
-
-    fn sqlalchemy_update_model_from_chain(&self, expr: &Expr) -> Option<Class> {
-        let Expr::Call(call) = expr else {
-            return None;
-        };
-        if self.is_sqlalchemy_update_call(call) {
-            return self.sqlalchemy_update_model_from_call(call);
-        }
-        let Expr::Attribute(attr_expr) = &*call.func else {
-            return None;
-        };
-        self.sqlalchemy_update_model_from_chain(&attr_expr.value)
-    }
-
-    fn is_sqlalchemy_update_call(&self, call: &ExprCall) -> bool {
-        let errors = self.error_swallower();
-        let func_ty = self.expr_infer(&call.func, &errors);
-        let Some(FunctionKind::Def(func_id)) = func_ty.to_func_kind() else {
-            return false;
-        };
-        func_id.qname.id().as_str() == "update"
-            && Self::is_sqlalchemy_module(func_id.qname.module_name())
-    }
-
-    fn is_sqlalchemy_module(module: ModuleName) -> bool {
-        let name = module.as_str();
-        // The `.` keeps unrelated distributions such as `sqlalchemy_utils` out.
-        name == "sqlalchemy" || name.starts_with("sqlalchemy.")
-    }
-
-    /// SQLAlchemy accepts a SQL expression anywhere a column value is expected, so
-    /// a value the library itself produced is not checked against the mapped type.
-    fn is_sqlalchemy_owned_type(ty: &Type) -> bool {
-        match ty {
-            Type::ClassType(cls) => Self::is_sqlalchemy_module(cls.qname().module_name()),
-            Type::Annotated(inner, _) => Self::is_sqlalchemy_owned_type(inner),
-            Type::Union(union) => union.members.iter().any(Self::is_sqlalchemy_owned_type),
-            _ => false,
-        }
-    }
-
-    fn sqlalchemy_update_model_from_call(&self, call: &ExprCall) -> Option<Class> {
-        let model_expr = call.arguments.args.first()?;
-        let errors = self.error_swallower();
-        match self.expr_infer(model_expr, &errors) {
-            Type::ClassDef(cls) => Some(cls),
-            Type::Type(boxed) => match *boxed {
-                Type::ClassType(cls) => Some(cls.into_class_object()),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    fn sqlalchemy_mapped_model_fields(&self, model: &Class) -> SmallSet<Name> {
-        // Find the SQLModel table model in the mro if there is one
-        let sqlmodel_table = self
-            .get_mro_for_class(model)
-            .ancestors_no_object()
-            .iter()
-            .rev()
-            .map(|cls| cls.class_object())
-            .chain(std::iter::once(model))
-            .skip_while(|cls| {
-                !(cls.has_toplevel_qname("sqlmodel", "SQLModel")
-                    || cls.has_toplevel_qname("sqlmodel.main", "SQLModel"))
-            })
-            .find(|cls| {
-                self.get_metadata_for_class(cls)
-                    .keywords()
-                    .iter()
-                    .any(|(name, typ)| {
-                        name == "table"
-                            && matches!(typ, Type::Literal(l) if l.value==Lit::Bool(true))
-                    })
-            });
-
-        // If there is a SQLModel table model we want to ignore the fields below it in the mro
-        let find_fields_from = sqlmodel_table.unwrap_or(model);
-
-        let mut seen_fields = SmallSet::new();
-        std::iter::once(find_fields_from)
-            .chain(
-                self.get_mro_for_class(find_fields_from)
-                    .ancestors_no_object()
-                    .iter()
-                    .map(|ancestor| ancestor.class_object()),
-            )
-            .flat_map(|class| self.get_class_field_map(class))
-            .filter_map(|(name, field)| {
-                if !seen_fields.insert(name.clone())
-                    || name.as_str().starts_with('_')
-                    || field.is_class_var()
-                {
-                    return None;
-                }
-                let (_, annotation, _) = field.for_variance_inference();
-                let is_mapped_annotation = annotation.is_some_and(|annotation| {
-                    Self::is_sqlalchemy_mapped_annotation(annotation.get_type())
-                });
-                (is_mapped_annotation || (sqlmodel_table.is_some() && annotation.is_some()))
-                    .then_some(name)
-            })
-            .collect()
-    }
-
-    fn is_sqlalchemy_mapped_annotation(ty: &Type) -> bool {
-        match ty {
-            Type::ClassType(cls) => {
-                cls.has_qname("sqlalchemy.orm", "Mapped")
-                    || cls.has_qname("sqlalchemy.orm.base", "Mapped")
-            }
-            Type::Annotated(inner, _) => Self::is_sqlalchemy_mapped_annotation(inner),
-            _ => false,
-        }
-    }
-
-    fn sqlalchemy_mapped_field_type(&self, model: &Class, field_name: &Name) -> Type {
-        let model_ty = self.instantiate(model);
-        let errors = self.error_swallower();
-        self.attr_infer_for_type(&model_ty, field_name, TextRange::default(), &errors, None)
     }
 
     fn tuple_infer(&self, x: &ExprTuple, hint: Option<HintRef>, errors: &ErrorCollector) -> Type {
@@ -2353,12 +2203,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 if self.solver().is_partial(hint) {
                     return None;
                 }
-                let (key_hint, value_hint) = self.decompose_dict(hint);
-                if key_hint.is_none() && value_hint.is_none() {
-                    None
-                } else {
-                    Some((key_hint, value_hint))
-                }
+                self.decompose_dict(hint)
             },
             |decomposed_hints, hint| {
                 let (key_hint, value_hint) = decomposed_hints.unwrap_or_default();
@@ -3705,37 +3550,25 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     fn list_literal_infer(
         &self,
         list: &ExprList,
-        elt_hint: Option<ListElementHint>,
+        elt_hint: Option<Type>,
         hint: Option<HintRef>,
         errors: &ErrorCollector,
     ) -> Type {
         if list.is_empty() {
-            let elem_ty = match elt_hint {
-                Some(ListElementHint::Hint(elem_hint)) => elem_hint,
-                Some(ListElementHint::UninformativeAny(_)) | None => self
-                    .solver()
+            let elem_ty = elt_hint.unwrap_or_else(|| {
+                self.solver()
                     .fresh_partial_contained(self.uniques, list.range)
-                    .to_type(self.heap),
-            };
+                    .to_type(self.heap)
+            });
             self.heap.mk_class_type(self.stdlib.list(elem_ty))
         } else {
-            let (elt_hint, partial_fallback) = elt_hint
-                .map(ListElementHint::into_parts)
-                .unwrap_or_default();
             let elem_tys = self.elts_infer(
                 &list.elts,
                 HintRef::with_ty_opt(hint, elt_hint.as_ref()),
                 errors,
             );
-            let ty = self
-                .heap
-                .mk_class_type(self.stdlib.list(self.unions(elem_tys)));
-            if let Some(partial_fallback) = partial_fallback {
-                self.solver()
-                    .replace_unresolved_partials(ty, &partial_fallback)
-            } else {
-                ty
-            }
+            self.heap
+                .mk_class_type(self.stdlib.list(self.unions(elem_tys)))
         }
     }
 
@@ -4441,7 +4274,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 }
                 Type::DataFrame(schema) => {
                     if let Expr::List(ExprList { elts, .. }) = slice
-                        && schema.kind == DataFrameKind::Polars
+                        && schema.kind.is_polars_api()
                     {
                         if elts.is_empty() {
                             return Type::DataFrame(schema);
@@ -4457,7 +4290,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         && let Some(name) = self.polars_column_name(slice)
                     {
                         match schema.columns.iter().find(|(c, _)| **c == name) {
-                            Some((_, dtype)) if schema.kind == DataFrameKind::Polars => {
+                            Some((_, dtype)) if schema.kind.is_polars_api() => {
                                 column_dtype = Some(dtype.clone());
                             }
                             Some(_) => {}
@@ -4484,7 +4317,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     // Preserve the stub's Series class when attaching an element dtype.
                     match (column_dtype, result) {
                         (Some(dtype), Type::ClassType(cls))
-                            if is_polars_series(cls.class_object()) =>
+                            if is_polars_api_series(cls.class_object()) =>
                         {
                             SeriesSchema {
                                 underlying: cls,

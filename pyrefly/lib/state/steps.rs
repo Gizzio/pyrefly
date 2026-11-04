@@ -67,6 +67,7 @@ pub struct Context<'a, Lookup> {
     pub spec_compliant_overloads: bool,
     pub legacy_overload_expansion: bool,
     pub treat_all_caps_as_final: bool,
+    pub infer_param_types_from_docstring: bool,
     pub recursion_limit_config: Option<RecursionLimitConfig>,
     /// Pysa context for building PysaSolutions during the Solutions step.
     pub pysa_context: Option<PysaContext<'a>>,
@@ -77,9 +78,8 @@ pub struct Context<'a, Lookup> {
 }
 
 /// AST and lexer tokens produced by the same parser invocation.
-/// Tokens are only retained when the require level is `Everything`
-/// (i.e. open files in the LSP), since they are only needed for
-/// semantic token highlighting.
+/// Tokens are retained at require level `Everything` (i.e. open files in the
+/// LSP) for features such as semantic token highlighting and signature help.
 #[derive(Debug, Dupe, Clone)]
 pub struct ParsedModule {
     module: Arc<ModModule>,
@@ -541,6 +541,7 @@ impl Step {
             ctx.require.keep_index(),
             ctx.infer_return_types,
             ctx.treat_all_caps_as_final,
+            ctx.infer_param_types_from_docstring,
         );
         Arc::new(Answers::new(bindings, solver, enable_index, enable_trace))
     }

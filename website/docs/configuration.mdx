@@ -233,6 +233,11 @@ or remove `project-excludes`.
       we recommend you pull and set up your dependency from GitHub, but you can achieve
       this on files in your `site-packages-path` by setting `site-packages-path = []` in
       your config.
+    - `--exclude-scripts` also skips the PEP 723 scripts (files with a `# /// script`
+      block) that Pyrefly finds in the project or in the given directories, and still
+      checks the files that you give explicitly. A script runs in its own environment, so
+      `uv check --type-checker pyrefly` passes `--exclude-scripts` and checks a script
+      with `uv check --script`.
 
 ### `disable-project-excludes-heuristics`
 
@@ -713,10 +718,16 @@ below this threshold are hidden from output. Diagnostics at or above the thresho
 displayed and cause a nonzero exit code — for example, `--min-severity warn` makes
 warnings cause a nonzero exit.
 
+When `min-severity` is not set, `pyrefly check` displays warnings and errors, and only
+errors cause a nonzero exit code. Warnings are also left out of `--suppress-errors`,
+baseline updates and the `junit-xml` report, which lists only diagnostics that cause a
+nonzero exit code.
+
 The lowest threshold, `"hint"`, also shows hint-level diagnostics such as
 [`unused-parameter`](../error-kinds#unused-parameter),
-[`unused-variable`](../error-kinds#unused-variable), and
-[`unused-import`](../error-kinds#unused-import). These are hidden by default, and
+[`unused-variable`](../error-kinds#unused-variable),
+[`unused-import`](../error-kinds#unused-import), and
+[`unreachable`](../error-kinds#unreachable). These are hidden by default, and
 showing them makes them count toward the exit code like any other displayed
 diagnostic.
 
@@ -732,7 +743,7 @@ min-severity = "warn"
 ```
 
 - Type: `"ignore"` | `"hint"` | `"info"` | `"warn"` | `"error"`
-- Default: `"error"`
+- Default: not set (warnings are displayed, and only errors cause a nonzero exit)
 - Flag equivalent: `--min-severity`
 - Notes:
     - `min-severity` is a **project-level setting** and cannot be overridden in
@@ -782,8 +793,9 @@ extends = "pyproject.toml"
 ### `required-version`
 
 Enforces a requirement on the version of Pyrefly at runtime. Pyrefly reports a
-configuration error if its version does not satisfy the requirement. This can
-keep local CLI runs, editor integrations, and CI on compatible versions.
+configuration error if its version does not satisfy the requirement. When this
+error stops `pyrefly check`, it exits with code 4. This can keep local CLI runs,
+editor integrations, and CI on compatible versions.
 
 ```toml
 # pyrefly.toml
@@ -847,7 +859,7 @@ The default Pyrefly configuration. Equivalent to having no preset at all.
 Enables additional error codes on top of the default for stricter checking.
 
 - Sets [`strict-callable-subtyping`](#strict-callable-subtyping) `= true`
-- Enables (as errors): [`direct-abstract-base-instantiation`](./error-kinds.mdx#direct-abstract-base-instantiation), [`implicit-any`](./error-kinds.mdx#implicit-any) (covers every implicit-`Any` sub-kind), [`method-assign`](./error-kinds.mdx#method-assign), [`missing-override-decorator`](./error-kinds.mdx#missing-override-decorator), [`open-unpacking`](./error-kinds.mdx#open-unpacking), [`possibly-uninitialized-attribute`](./error-kinds.mdx#possibly-uninitialized-attribute), [`potential-bad-keyword-argument`](./error-kinds.mdx#potential-bad-keyword-argument), [`unused-ignore`](./error-kinds.mdx#unused-ignore)
+- Enables (as errors): [`direct-abstract-base-instantiation`](./error-kinds.mdx#direct-abstract-base-instantiation), [`implicit-any`](./error-kinds.mdx#implicit-any) (covers every implicit-`Any` sub-kind), [`instance-var-assign`](./error-kinds.mdx#instance-var-assign), [`method-assign`](./error-kinds.mdx#method-assign), [`missing-override-decorator`](./error-kinds.mdx#missing-override-decorator), [`open-unpacking`](./error-kinds.mdx#open-unpacking), [`possibly-uninitialized-attribute`](./error-kinds.mdx#possibly-uninitialized-attribute), [`potential-bad-keyword-argument`](./error-kinds.mdx#potential-bad-keyword-argument), [`unused-ignore`](./error-kinds.mdx#unused-ignore)
 
 #### Preset: `all`
 
@@ -856,7 +868,7 @@ For most users, we recommend using the `strict` preset and enabling individual a
 for more stability and an opt-in experience for new errors.
 :::
 
-Enables every error kind at `error` severity. Directives like `reveal-type` remain informational, and kinds that default to `hint`, like `unused-parameter`, remain hints.
+Enables every error kind at `error` severity. Directives like `reveal-type` remain informational, and the unused-code kinds (`unused-parameter`, `unused-variable` and `unused-import`) remain hints.
 
 - Sets [`strict-callable-subtyping`](#strict-callable-subtyping) `= true`
 - Enables every error kind at `error` severity
@@ -869,7 +881,7 @@ Configure the severity for each kind of error that Pyrefly emits: `error`, `warn
 Want full type-check squiggles in your editor? Run `pyrefly init` to create a `pyrefly.toml` (or update `pyproject.toml`).
 :::
 
-- Type: Table of [error code](./error-kinds.mdx) to boolean representing enabled status
+- Type: Table of [error code](./error-kinds.mdx) to a severity (`"error"`, `"warn"`, `"info"`, `"hint"`, or `"ignore"`) or a boolean
 - Default: `errors = {}`/`[errors]`
 - Flag equivalent: `--error`, `--warn`, `--ignore`
 - Equivalent configs:
@@ -880,6 +892,8 @@ Want full type-check squiggles in your editor? Run `pyrefly init` to create a `p
   [`disable_error_code`](https://mypy.readthedocs.io/en/stable/config_file.html#confval-disable_error_code)
   in mypy
 - Notes:
+    - Setting `<error-code> = "<severity>"` (for example, `bad-return = "warn"`) sets the
+      diagnostic's severity.
     - Setting `<error-code> = true` means the error will be shown at default
       severity (or severity `ERROR` if the error is off by default). Setting
       `<error-code> = false` will disable the error for type checking.
@@ -1066,6 +1080,34 @@ set `infer-return-types` to `"never"` in your config or pass it as a flag.
 - Type: one of `"never"`, `"annotated"`, `"checked"`
 - Default: `"checked"`
 - Flag equivalent: `--infer-return-types`
+
+### `infer-param-types-from-docstring`
+
+Whether to use the parameter types that a Sphinx style docstring declares for parameters
+that have no annotation.
+
+```python
+def f(x, y=None):
+    """
+    :param int x: The x.
+    :type y: str
+    """
+```
+
+Here `x` is an `int` and `y` is a `str | None`. A parameter that defaults to `None` is
+treated as optional even when the docstring does not say so. For `__init__`, the docstring
+of the class is used as well, because that is where the constructor parameters are usually
+documented. The docstring of the method itself takes priority.
+
+A type from a docstring is only a hint for callers and for the body of the function. It is
+never used instead of an annotation, it does not make assignments to the parameter an
+error, and it is not checked against the default value. A type that Pyrefly cannot make
+sense of, such as `list of str` written as prose, an unknown name, or a type that is not
+valid for a parameter, is ignored without an error.
+
+- Type: `bool`
+- Default: `false`
+- Flag equivalent: `--infer-param-types-from-docstring`
 
 ### `strict-callable-subtyping`
 

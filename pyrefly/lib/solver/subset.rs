@@ -15,7 +15,6 @@ use itertools::Itertools;
 use itertools::izip;
 use pyrefly_python::dunder;
 use pyrefly_types::callable::Callable;
-use pyrefly_types::data_frame::DataFrameKind;
 use pyrefly_types::dimension::Int;
 use pyrefly_types::dimension::ShapeError;
 use pyrefly_types::dimension::contains_var_in_type;
@@ -2431,16 +2430,14 @@ impl<'solver, 'subset, Ans: LookupAnswer> Subset<'solver, 'subset, Ans> {
                     &got_schema.underlying_type(),
                     &want_schema.underlying_type(),
                 )?;
-                if want_schema.kind == DataFrameKind::Polars && want_schema.is_contract() {
+                if want_schema.kind.is_polars_api() && want_schema.is_contract() {
                     ok_or(got_schema.satisfies(want_schema), SubsetError::Other)
                 } else {
                     Ok(())
                 }
             }
             (Type::DataFrame(schema), _) => self.is_subset_eq(&schema.underlying_type(), want),
-            (_, Type::DataFrame(schema))
-                if schema.kind == DataFrameKind::Polars && schema.is_contract() =>
-            {
+            (_, Type::DataFrame(schema)) if schema.kind.is_polars_api() && schema.is_contract() => {
                 Err(SubsetError::Other)
             }
             (_, Type::DataFrame(schema)) => self.is_subset_eq(got, &schema.underlying_type()),
@@ -2569,6 +2566,14 @@ impl<'solver, 'subset, Ans: LookupAnswer> Subset<'solver, 'subset, Ans> {
                 //
                 // https://github.com/python/typeshed/blob/5c8b7fcbbeb4af2d7e9f33e745a7863e401c2578/stdlib/typing.pyi#L638
                 Ok(())
+            }
+            // `Self@C` is a subtype of `C`, so a protocol that `C` explicitly inherits is satisfied
+            // nominally, as it is for `C` itself.
+            (Type::SelfType(got), Type::ClassType(want))
+                if self.type_order.is_protocol(want.class_object())
+                    && let Some(got) = self.type_order.as_superclass(got, want.class_object()) =>
+            {
+                self.check_targs(&got, want)
             }
             (_, Type::ClassType(want)) if self.type_order.is_protocol(want.class_object()) => {
                 self.is_subset_protocol(got.clone(), want.clone())
@@ -2803,6 +2808,16 @@ impl<'solver, 'subset, Ans: LookupAnswer> Subset<'solver, 'subset, Ans> {
                 Ok(())
             }
             (Type::QuantifiedValue(_), Type::ClassType(cls)) if is_int_class_type(cls) => Ok(()),
+            // Enum literal expansion makes a sole non-Flag member equivalent to its enum type.
+            (Type::ClassType(got_cls), Type::Literal(lit))
+                if let Lit::Enum(enum_lit) = &lit.value
+                    && got_cls.class_object() == enum_lit.class.class_object()
+                    && self
+                        .type_order
+                        .enum_literal_covers_class(got_cls.class_object(), &enum_lit.member) =>
+            {
+                Ok(())
+            }
             (Type::Literal(l_lit), Type::Literal(u_lit)) => {
                 ok_or(l_lit.value == u_lit.value, SubsetError::Other)
             }

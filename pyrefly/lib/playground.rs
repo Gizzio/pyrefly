@@ -14,6 +14,7 @@ use dupe::Dupe;
 use lsp_types::CompletionItem;
 use lsp_types::CompletionItemKind;
 use lsp_types::Contents;
+use lsp_types::DiagnosticTag;
 use lsp_types::SemanticTokens;
 use lsp_types::SemanticTokensLegend;
 use lsp_types::TextEdit;
@@ -37,7 +38,7 @@ use starlark_map::small_map::SmallMap;
 
 use crate::config::config::ConfigFile;
 use crate::config::config::toml_error_span;
-use crate::config::error_kind::Severity;
+use crate::config::error_kind::ShownSeverity;
 use crate::config::finder::ConfigFinder;
 use crate::lsp::wasm::hover::get_hover;
 use crate::memory_project::memory_config;
@@ -151,6 +152,8 @@ pub struct Diagnostic {
     pub message_details: String,
     pub kind: String,
     pub severity: i32,
+    /// Monaco marker tags, which use the same numbers as LSP diagnostic tags.
+    pub tags: Vec<DiagnosticTag>,
     pub filename: String,
 }
 
@@ -274,6 +277,7 @@ impl Playground {
                         kind: "parse-error".to_owned(),
                         // MarkerSeverity.Error (8)
                         severity: 8,
+                        tags: Vec::new(),
                         filename: "pyrefly.toml".to_owned(),
                     });
                     if !force_update {
@@ -413,9 +417,10 @@ impl Playground {
             output_errors.extend(collected.directives);
             output_errors.extend(unused.ordinary);
             output_errors.extend(unused.hints);
-            let file_errors = output_errors.into_map(|e| {
+            let file_errors = output_errors.into_iter().filter_map(|e| {
+                let severity = e.severity().shown()?;
                 let range = e.display_range();
-                Diagnostic {
+                Some(Diagnostic {
                     start_line: range.start.line_within_file().get() as i32,
                     start_col: range.start.column().get() as i32,
                     end_line: range.end.line_within_file().get() as i32,
@@ -424,14 +429,17 @@ impl Playground {
                     message_details: e.msg_details().unwrap_or("").to_owned(),
                     kind: e.error_kind().to_name().to_owned(),
                     // Severity values defined here: https://github.com/microsoft/vscode/blob/main/src/vs/editor/common/standalone/standaloneEnums.ts
-                    severity: match e.severity() {
-                        Severity::Error => 8,
-                        Severity::Warn => 4,
-                        Severity::Info => 2,
-                        Severity::Hint | Severity::Ignore => 1,
+                    severity: match severity {
+                        ShownSeverity::Error => 8,
+                        ShownSeverity::Warn => 4,
+                        ShownSeverity::Info => 2,
+                        // As in the LSP, a hint without its own editor look is shown like `info`.
+                        ShownSeverity::Hint if e.editor_tag().is_none() => 2,
+                        ShownSeverity::Hint => 1,
                     },
+                    tags: e.editor_tag().into_iter().collect(),
                     filename: filename.clone(),
-                }
+                })
             });
             all_diagnostics.extend(file_errors);
         }
@@ -1112,5 +1120,33 @@ mod tests {
 
         let kinds: Vec<_> = state.get_errors().into_iter().map(|e| e.kind).collect();
         assert!(kinds.is_empty(), "unexpected diagnostics: {kinds:?}");
+    }
+
+    // https://github.com/facebook/pyrefly/issues/5113
+    #[test]
+    fn test_kind_set_to_hint_in_config() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+        files.insert(
+            "main.py".to_owned(),
+            "import os\nx: int = \"wrong\"\n".to_owned(),
+        );
+        files.insert(
+            "pyrefly.toml".to_owned(),
+            "[errors]\nbad-assignment = \"hint\"\n".to_owned(),
+        );
+        state.update_sandbox_files(files, true);
+        state.set_active_file("main.py");
+
+        let errors = state.get_errors();
+        // The severity and the serialized tags are what Monaco receives.
+        let marker = |kind: &str| {
+            let e = errors.iter().find(|e| e.kind == kind).unwrap();
+            (e.severity, serde_json::to_string(&e.tags).unwrap())
+        };
+        // MarkerSeverity.Hint with MarkerTag.Unnecessary, drawn greyed out.
+        assert_eq!(marker("unused-import"), (1, "[1]".to_owned()));
+        // MarkerSeverity.Info, with no tag.
+        assert_eq!(marker("bad-assignment"), (2, "[]".to_owned()));
     }
 }

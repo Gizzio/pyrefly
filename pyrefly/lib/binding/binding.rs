@@ -77,6 +77,8 @@ use crate::binding::base_class::BaseClassGeneric;
 use crate::binding::bindings::BindingEntry;
 use crate::binding::bindings::BindingTable;
 use crate::binding::bindings::Bindings;
+use crate::binding::bindings::UnsetNodeId;
+use crate::binding::classmethod::MethodReceiverKind;
 use crate::binding::django::DjangoFieldInfo;
 use crate::binding::narrow::NarrowOp;
 use crate::binding::narrow::NarrowingSubject;
@@ -128,7 +130,7 @@ assert_words!(KeyDecoratedFunction, 1);
 assert_words!(KeyUndecoratedFunction, 1);
 
 assert_words!(Binding, 4);
-assert_words!(BindingExpect, 12);
+assert_words!(BindingExpect, 8);
 assert_words!(BindingTypeAlias, 6);
 assert_words!(BindingAnnotation, 11);
 assert_words!(BindingClass, 11);
@@ -991,6 +993,9 @@ pub enum Key {
     SuppressedException(TextRange),
     /// A suppression-only query for a narrow view, separate from normal with completion.
     SuppressionNarrow(TextRange),
+    /// The termination of a merged flow whose live branches each ended in a statement that
+    /// may have type `Never`. Solves to `Never` only if every branch does.
+    FlowTermination(TextRange),
     /// One syntactic exception-class expression from an `except` clause. A clause
     /// listing a tuple of classes has one of these per element.
     ExceptionClass(TextRange),
@@ -999,6 +1004,8 @@ pub enum Key {
     /// The end of one suite in an `if`/`elif`/`else` chain, keyed by the clause's range. The
     /// fall-through of a chain with no `else` is keyed by the empty range at the chain's start.
     BranchEnd(TextRange),
+    /// A module-wide boolean summary of calls that may mutate function wrapping state.
+    FunctoolsWrapperMutation(TextRange),
 }
 
 impl Ranged for Key {
@@ -1037,9 +1044,10 @@ impl Ranged for Key {
             Self::PatternNarrow(r) => *r,
             Self::Exhaustive(_, r) => *r,
             Self::SuppressedException(r) | Self::SuppressionNarrow(r) => *r,
+            Self::FlowTermination(r) => *r,
             Self::ExceptionClass(r) => *r,
             Self::BranchTest(r) => *r,
-            Self::BranchEnd(r) => *r,
+            Self::BranchEnd(r) | Self::FunctoolsWrapperMutation(r) => *r,
         }
     }
 }
@@ -1092,9 +1100,13 @@ impl DisplayWith<ModuleInfo> for Key {
                 write!(f, "Key::SuppressedException({})", ctx.display(r))
             }
             Self::SuppressionNarrow(r) => write!(f, "Key::SuppressionNarrow({})", ctx.display(r)),
+            Self::FlowTermination(r) => write!(f, "Key::FlowTermination({})", ctx.display(r)),
             Self::ExceptionClass(r) => write!(f, "Key::ExceptionClass({})", ctx.display(r)),
             Self::BranchTest(r) => write!(f, "Key::BranchTest({})", ctx.display(r)),
             Self::BranchEnd(r) => write!(f, "Key::BranchEnd({})", ctx.display(r)),
+            Self::FunctoolsWrapperMutation(r) => {
+                write!(f, "Key::FunctoolsWrapperMutation({})", ctx.display(r))
+            }
         }
     }
 }
@@ -1215,7 +1227,8 @@ pub enum ExprOrBinding {
 pub struct PrivateAttributeAccessCheck {
     pub value: Expr,
     pub attr: Identifier,
-    pub class_idx: Option<Idx<KeyClass>>,
+    /// Enclosing classes, from innermost to outermost.
+    pub class_idxs: Vec<Idx<KeyClass>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1303,7 +1316,7 @@ pub enum BindingExpect {
     MatchExhaustiveness {
         subject_idx: Idx<Key>,
         narrowing_subject: Option<NarrowingSubject>,
-        narrow_ops_for_fall_through: (Box<NarrowOp>, TextRange),
+        narrow_ops_for_fall_through: Box<(NarrowOp, TextRange)>,
         subject_range: TextRange,
         // Should we show the raw expression of the match subject instead of the name?
         show_subject_expr: bool,
@@ -1312,7 +1325,12 @@ pub enum BindingExpect {
     MatchCaseReachability {
         subject_idx: Idx<Key>,
         narrowing_subject: Option<NarrowingSubject>,
-        narrow_ops_for_case: (Box<NarrowOp>, TextRange),
+        narrow_ops_for_case: Box<(NarrowOp, TextRange)>,
+        /// Negations from earlier unguarded cases in the same match, in the
+        /// same subject coordinates as `narrow_ops_for_case`. Reachability
+        /// narrows by the current pattern first, then applies these, so an
+        /// `Any` subject can first become `bool` and then subtract `int`.
+        prev_case_negations: Option<Box<(NarrowOp, TextRange)>>,
         case_range: TextRange,
     },
     /// Code following one or more points in a suite that control passes only conditionally, such
@@ -1345,27 +1363,28 @@ pub enum BindingExpect {
         range: TextRange,
     },
     /// Track private attribute accesses that need semantic validation.
-    PrivateAttributeAccess(PrivateAttributeAccessCheck),
+    PrivateAttributeAccess(Box<PrivateAttributeAccessCheck>),
     /// Deferred check for uninitialized variables. This is a "dangling" binding
     /// that doesn't affect any other types - it only exists to emit an error at
-    /// solve time if any of the termination keys don't have Never type.
+    /// solve time if some path on which the variable is unset reaches the use.
     UninitializedCheck {
         /// The variable name (for error messages).
         name: Name,
         /// The range of the variable usage (for error location).
         range: TextRange,
-        /// Termination keys from branches that don't define the variable.
-        /// At solve time, we check if ALL of these have Never type.
-        /// If any don't, the variable may be uninitialized.
-        termination_keys: Vec<Idx<Key>>,
+        /// The latest merges on the paths on which the variable is unset. If any of those paths
+        /// reaches the use, the variable may be uninitialized.
+        unset_nodes: Vec<UnsetNodeId>,
     },
     /// Check whether a class-body attribute is initialized on every completing path.
     UninitializedAttributeCheck {
         name: Name,
         range: TextRange,
         class: Idx<KeyClass>,
-        /// All missing paths must terminate. None means a path lacks termination evidence.
-        termination_keys: Option<Vec<Idx<Key>>>,
+        /// The latest merges on the paths on which the attribute is unset, as for
+        /// `UninitializedCheck`. `None` means some path has no termination key, so the attribute
+        /// may be uninitialized.
+        unset_nodes: Option<Vec<UnsetNodeId>>,
     },
     /// Check for forward reference string literal in union type.
     /// At runtime, `type.__or__` cannot handle string literals, so expressions
@@ -1456,11 +1475,10 @@ impl DisplayWith<Bindings> for BindingExpect {
                 "PrivateAttributeAccess({}, {}, {})",
                 m.display(&expectation.value),
                 expectation.attr.id,
-                if let Some(class_idx) = expectation.class_idx {
-                    format!("{}", ctx.display(class_idx))
-                } else {
-                    "None".to_owned()
-                }
+                intersperse_iter(", ", || expectation
+                    .class_idxs
+                    .iter()
+                    .map(|idx| ctx.display(*idx)))
             ),
             Self::MatchExhaustiveness {
                 subject_idx,
@@ -1529,21 +1547,21 @@ impl DisplayWith<Bindings> for BindingExpect {
             Self::UninitializedCheck {
                 name,
                 range,
-                termination_keys,
+                unset_nodes,
             } => {
                 write!(
                     f,
                     "UninitializedCheck({}, {}, {:?})",
                     name,
                     ctx.module().display(range),
-                    termination_keys
+                    unset_nodes
                 )
             }
             Self::UninitializedAttributeCheck {
                 name,
                 range,
                 class,
-                termination_keys,
+                unset_nodes,
             } => {
                 write!(
                     f,
@@ -1551,7 +1569,7 @@ impl DisplayWith<Bindings> for BindingExpect {
                     name,
                     ctx.module().display(range),
                     class,
-                    termination_keys
+                    unset_nodes
                 )
             }
             Self::ForwardRefUnion {
@@ -2054,7 +2072,13 @@ impl IsAsync {
 #[derive(Clone, Debug)]
 pub enum FunctionParameter {
     Annotated(Idx<KeyAnnotation>),
-    Unannotated(Idx<KeyUndecoratedFunction>, AnnotationTarget, Name),
+    /// The final field is the type that the docstring declares for the parameter, if any.
+    Unannotated(
+        Idx<KeyUndecoratedFunction>,
+        AnnotationTarget,
+        Name,
+        Option<Idx<KeyAnnotation>>,
+    ),
 }
 
 #[derive(Clone, Debug)]
@@ -2076,6 +2100,7 @@ pub struct FunctionDefData {
     pub parameters: Box<Parameters>,
     pub type_params: Option<Box<TypeParams>>,
     pub is_async: bool,
+    pub(crate) method_receiver: MethodReceiverKind,
     pub range: TextRange,
 }
 
@@ -2086,6 +2111,7 @@ impl FunctionDefData {
             parameters: def.parameters,
             type_params: def.type_params,
             is_async: def.is_async,
+            method_receiver: MethodReceiverKind::None,
             range: def.range,
         }
     }
@@ -3088,7 +3114,7 @@ impl DisplayWith<Bindings> for Binding {
                 "FunctionParameter({})",
                 match x.as_ref() {
                     FunctionParameter::Annotated(k) => ctx.display(*k).to_string(),
-                    FunctionParameter::Unannotated(k, _, _) => ctx.display(*k).to_string(),
+                    FunctionParameter::Unannotated(k, _, _, _) => ctx.display(*k).to_string(),
                 }
             ),
             Self::SuperInstance(x) => match &x.0 {
@@ -3462,6 +3488,9 @@ pub enum BindingAnnotation {
     /// The type is annotated to be this key, will have the outer type removed.
     /// Optionally occurring within a class, in which case Self refers to this class.
     AnnotateExpr(AnnotationTarget, Expr, Option<Idx<KeyClass>>),
+    /// The type that a docstring declares for the unannotated parameter with this name.
+    /// Docstrings are informal, so a type that does not check is dropped without an error.
+    DocstringParam(Name, Expr),
     /// A special form declaration like `Literal: _SpecialForm`.
     SpecialForm(AnnotationTarget, SpecialForm),
 }
@@ -3478,6 +3507,9 @@ impl DisplayWith<Bindings> for BindingAnnotation {
                     Some(t) => ctx.display(*t).to_string(),
                 }
             ),
+            Self::DocstringParam(name, x) => {
+                write!(f, "DocstringParam({name}, {})", ctx.module().display(x))
+            }
             Self::SpecialForm(target, sf) => write!(f, "SpecialForm({target}, {sf})"),
         }
     }

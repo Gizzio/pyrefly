@@ -2,7 +2,7 @@
 
 [package]
 name = "pyrefly"
-version = "1.4.0"
+version = "1.5.0-dev.1"
 authors = ["Meta"]
 edition = "2024"
 repository = "https://github.com/facebook/pyrefly"
@@ -62,7 +62,7 @@ itertools = "0.15.0"
 lsp-server = "0.10.0"
 lsp_types = { package = "gen-lsp-types", version = "0.11.0", features = ["url"] }
 num-traits = { version = "0.2.19", default-features = false }
-parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
+parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard", "serde"] }
 parse-display = "0.8.2"
 paste = "1.0.14"
 percent-encoding = "2.1"
@@ -86,13 +86,13 @@ ruff_text_size = "0.0.14"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.154", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 serde_repr = "0.1.21"
-similar = { version = "3.2.0", features = ["bytes", "inline", "unicode"] }
+similar = { version = "3.2.1", features = ["bytes", "inline", "unicode"] }
 starlark_map = "0.14.2"
 static_assertions = "1.1.0"
 tempfile = "3.27.0"
-thin-vec = "0.2.20"
+thin-vec = "0.2.21"
 thiserror = "2.0.21"
-tokio = { version = "1.53.2", features = ["macros", "rt"] }
+tokio = { version = "1.54.1", features = ["macros", "rt"] }
 toml = { version = "1.1.8", features = ["preserve_order"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 tsp_types = { path = "../crates/tsp_types" }

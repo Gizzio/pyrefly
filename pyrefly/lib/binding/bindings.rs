@@ -12,8 +12,10 @@ use std::fmt::Display;
 use std::slice;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use dupe::Dupe;
+use fxhash::FxHashMap;
 use itertools::Itertools;
 use pyrefly_graph::index::Idx;
 use pyrefly_graph::index::Index;
@@ -33,8 +35,10 @@ use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::gas::Gas;
 use pyrefly_util::suggest::Candidate;
 use pyrefly_util::suggest::Search;
+use ruff_python_ast::AtomicNodeIndex;
 use ruff_python_ast::Expr;
 use ruff_python_ast::ExprAttribute;
+use ruff_python_ast::ExprBooleanLiteral;
 use ruff_python_ast::Identifier;
 use ruff_python_ast::ModModule;
 use ruff_python_ast::Parameter;
@@ -125,6 +129,7 @@ use crate::binding::table::TableKeyed;
 use crate::config::base::InferReturnTypes;
 use crate::config::error_kind::ErrorKind;
 use crate::error::collector::ErrorCollector;
+use crate::export::definitions::Definitions;
 use crate::export::definitions::MutableCaptureKind;
 use crate::export::exports::Exports;
 use crate::export::exports::LookupExport;
@@ -182,14 +187,66 @@ impl NameLookupResult {
     }
 }
 
+/// Identifies an `UnsetNode` in the module's table of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UnsetNodeId(u32);
+
+/// A merge that paths on which a name is unset pass through. The nodes form a graph rather than a
+/// list of paths, so that paths which share their earlier merges share their nodes, and the graph
+/// grows by at most one node per value at each merge.
+#[derive(Debug, Clone)]
+pub struct UnsetNode {
+    /// The termination keys of the branches that carry the paths through this merge. A path
+    /// continues past the merge only if one of these keys does not have `Never` type.
+    pub keys: Box<[Idx<Key>]>,
+    /// The nodes of the merges the paths passed through before this one, each created before
+    /// this node. Empty for the merge at which the name became unset.
+    pub previous: Box<[UnsetNodeId]>,
+}
+
+/// The table of `UnsetNode`s for a module, which only grows while binding.
+#[derive(Debug, Clone, Default)]
+pub struct UnsetNodes(Vec<UnsetNode>);
+
+impl UnsetNodes {
+    /// Add the node for the merge at which a name became unset.
+    pub fn push_start(&mut self, keys: Vec<Idx<Key>>) -> UnsetNodeId {
+        self.push(keys, Vec::new())
+    }
+
+    /// Add the node for a later merge on paths that already passed through `previous`, which must
+    /// be non-empty, since an empty `previous` marks the merge at which the name became unset.
+    pub fn push_merge(&mut self, keys: Vec<Idx<Key>>, previous: Vec<UnsetNodeId>) -> UnsetNodeId {
+        assert!(
+            !previous.is_empty(),
+            "a later merge must follow earlier nodes"
+        );
+        self.push(keys, previous)
+    }
+
+    fn push(&mut self, keys: Vec<Idx<Key>>, previous: Vec<UnsetNodeId>) -> UnsetNodeId {
+        let id = UnsetNodeId(self.0.len() as u32);
+        self.0.push(UnsetNode {
+            keys: keys.into_boxed_slice(),
+            previous: previous.into_boxed_slice(),
+        });
+        id
+    }
+
+    pub fn get(&self, id: UnsetNodeId) -> &UnsetNode {
+        &self.0[id.0 as usize]
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum InitializedInFlow {
     Yes,
     Conditionally,
     No,
-    /// Initialization depends on whether these termination keys have Never type.
-    /// If ALL termination keys are Never, the variable is initialized; otherwise it may be uninitialized.
-    DeferredCheck(Vec<Idx<Key>>),
+    /// Initialization depends on whether termination keys have Never type. The nodes are the
+    /// latest merges on the paths on which the variable is unset. If none of those paths reaches
+    /// the use, the variable is initialized; otherwise it may be uninitialized.
+    DeferredCheck(Vec<UnsetNodeId>),
 }
 
 impl InitializedInFlow {
@@ -202,9 +259,9 @@ impl InitializedInFlow {
         }
     }
 
-    pub fn deferred_termination_keys(&self) -> Option<&[Idx<Key>]> {
+    pub fn deferred_unset_nodes(&self) -> Option<&[UnsetNodeId]> {
         match self {
-            InitializedInFlow::DeferredCheck(keys) => Some(keys),
+            InitializedInFlow::DeferredCheck(nodes) => Some(nodes),
             _ => None,
         }
     }
@@ -228,19 +285,36 @@ pub struct Bindings {
     module_ranges: Arc<ModuleRanges>,
     /// Ranges of `Annotated` metadata, sorted and non-overlapping.
     annotated_metadata_ranges: Vec<TextRange>,
+    /// Ranges of the types that were read from docstrings, sorted and non-overlapping.
+    docstring_type_ranges: Vec<TextRange>,
     scope_trace: Option<ScopeTrace>,
     /// Names `del`eted at module scope; retained outside the LSP `scope_trace`.
     module_deletes: SmallSet<Name>,
+    /// The merges that paths on which a name is unset pass through, read by deferred
+    /// initialization checks.
+    unset_nodes: UnsetNodes,
+    /// Names that a function or class body declares `global`, and so may rebind or delete.
+    global_declarations: SmallSet<Name>,
+    /// See `Bindings::environment_definitions`.
+    environment_definitions: SmallMap<Idx<Key>, TextRange>,
+    /// See `Bindings::environment_names`.
+    environment_names: SmallSet<Name>,
     unused_imports: Vec<UnusedImport>,
     unused_variables: Vec<UnusedVariable>,
     pytest_info: Option<PytestBindingInfo>,
+    /// Literal setter names and their receiver ranges, retained only for IDE operations.
+    setattr_name_literals: Vec<(Identifier, TextRange)>,
     promote_ranges: SmallSet<TextRange>,
+    /// Immutable module-wide wrapping uncertainty, read as a solver dependency by `inspect.unwrap`.
+    functools_wrapper_mutation: Idx<Key>,
     /// Yield and yield-from indices for each lambda that contains yields,
     /// keyed by the lambda's TextRange. Populated at binding time so the
     /// solver can look up yield info without re-walking the AST.
     lambda_yield_keys: Vec<(TextRange, Box<[Idx<KeyYield>]>, Box<[Idx<KeyYieldFrom>]>)>,
     /// For each binding that owns lambdas, the parameters of those lambdas.
     owned_lambda_params: SmallMap<Idx<Key>, Vec<LambdaParamId>>,
+    /// Context-dependent parameter reads reached through forwards and narrowing joins.
+    lambda_parameter_derived: OnceLock<FxHashMap<Idx<Key>, LambdaParamId>>,
     /// Class body ranges paired with class indices. Used by the solver to
     /// recover the enclosing class for an expression that resolves to
     /// `typing.Self`, without needing a per-`Self`-use bind-time key.
@@ -248,6 +322,11 @@ pub struct Bindings {
     /// so a reverse iteration with "first containing range" yields the
     /// innermost enclosing class.
     class_scopes: Vec<(TextRange, Idx<KeyClass>)>,
+    /// Call expressions in the base class lists of `class` statements, paired with the classes
+    /// they belong to. Call bases never nest, so at most one entry contains a given range.
+    call_base_classes: Vec<(TextRange, ClassDefIndex)>,
+    /// Class-body definitions and their owning fields. Other scopes have no entries.
+    class_field_definitions: SmallMap<Idx<Key>, KeyClassField>,
     pub(crate) shape_declarations: ShapeDeclarations,
     /// Annotation-only declarations (`x: Final[int]`) that are subsequently
     /// initialized by an assignment that cannot be syntactically merged with
@@ -302,6 +381,8 @@ pub struct BindingsBuilder<'a> {
     pub module_info: ModuleInfo,
     /// Ranges of `Annotated` metadata, inside which bindings only report name resolution errors.
     pub(crate) annotated_metadata_ranges: Vec<TextRange>,
+    /// Ranges of the types that were read from docstrings.
+    pub(crate) docstring_type_ranges: Vec<TextRange>,
     pub lookup: &'a dyn LookupExport,
     pub sys_info: SysInfo,
     pub metadata: BindingsMetadata,
@@ -312,6 +393,8 @@ pub struct BindingsBuilder<'a> {
     solver: &'a Solver,
     pub has_docstring: bool,
     pub scopes: Scopes,
+    /// Active only in candidate class bodies, including their parameter-default scopes.
+    pub(super) track_classmethod_uses: bool,
     table: BindingTable,
     pub check_unannotated_defs: bool,
     /// When true, unannotated function bodies are still analyzed (creating
@@ -321,12 +404,19 @@ pub struct BindingsBuilder<'a> {
     pub analyze_unannotated_for_ide: bool,
     pub infer_return_types: InferReturnTypes,
     pub treat_all_caps_as_final: bool,
+    pub infer_param_types_from_docstring: bool,
     unused_imports: Vec<UnusedImport>,
     unused_variables: Vec<UnusedVariable>,
     django_relation_classes: Vec<DjangoRelationClass>,
     semantic_checker: SemanticSyntaxChecker,
     semantic_syntax_errors: RefCell<Vec<SemanticSyntaxError>>,
     pytest_info: Option<crate::binding::pytest::PytestBindingInfo>,
+    /// Names that a function or class body declares `global`.
+    global_declarations: SmallSet<Name>,
+    /// See `Bindings::environment_definitions`.
+    environment_definitions: SmallMap<Idx<Key>, TextRange>,
+    /// See `Bindings::environment_names`.
+    environment_names: SmallSet<Name>,
     /// BoundName lookups keyed by source occurrence and finalized in insertion order.
     deferred_bound_names: SmallMap<ShortIdentifier, DeferredBoundName>,
     /// Yield and yield-from indices for lambdas that contain yields.
@@ -334,11 +424,16 @@ pub struct BindingsBuilder<'a> {
     /// Lambda parameters, grouped by their lambdas' owners.
     owned_lambda_params: SmallMap<Idx<Key>, Vec<LambdaParamId>>,
     next_lambda_param_id: u32,
+    /// See `Bindings::setattr_name_literals`; batch checking does not retain these references.
+    pub(super) setattr_name_literals: Option<Vec<(Identifier, TextRange)>>,
     /// Class body ranges paired with class indices, populated as
     /// `class_def_inner` enters each class body. The solver uses this to
     /// recover the enclosing class for a given expression range without
     /// needing a per-`Self`-use bind-time key.
     pub class_scopes: Vec<(TextRange, Idx<KeyClass>)>,
+    /// Call bases of `class` statements, paired with their classes' definition indices.
+    pub(crate) call_base_classes: Vec<(TextRange, ClassDefIndex)>,
+    class_field_definitions: SmallMap<Idx<Key>, KeyClassField>,
     pub shape_declarations: ShapeDeclarations,
     pub(super) shape_comments: ShapeComments,
     /// The annotation whose `Shaped` string or comment payload is being bound.
@@ -349,7 +444,12 @@ pub struct BindingsBuilder<'a> {
     /// set by `stmts()` and consumed by namedtuple synthesis in `stmt()`.
     pub adjacent_namedtuple_defaults: Option<Vec<Expr>>,
     pub promote_ranges: SmallSet<TextRange>,
+    /// Lexical may-mutation summary: branches, loops, and nested bodies cannot clear it.
+    pub(super) has_functools_wrapper_mutation: bool,
     pub type_checking_depth: usize,
+    /// The range of the innermost clause being bound that is at or after the first test of the
+    /// environment in its `if`. See `Bindings::environment_definitions`.
+    pub(super) environment_suite: Option<TextRange>,
     /// True while binding the outermost known-unreachable suite. The call that sets this flag
     /// owns resetting it after nested `stmts()` calls, suppressing duplicate diagnostics.
     pub(super) in_unreachable_suite: bool,
@@ -386,6 +486,31 @@ fn merge_ranges(mut ranges: Vec<TextRange>) -> Vec<TextRange> {
     merged
 }
 
+/// Whether `range` lies inside one of `ranges`, which must come from `merge_ranges`.
+fn ranges_contain(ranges: &[TextRange], range: TextRange) -> bool {
+    let idx = ranges.partition_point(|r| r.start() <= range.start());
+    idx > 0 && ranges[idx - 1].contains_range(range)
+}
+
+/// Bind a constant summary so adding or removing a mutator invalidates dependent unwrap answers.
+fn bind_functools_wrapper_mutation(
+    table: &mut BindingTable,
+    range: TextRange,
+    has_mutation: bool,
+) -> Idx<Key> {
+    table.insert(
+        Key::FunctoolsWrapperMutation(range),
+        Binding::Expr(
+            None,
+            Box::new(Expr::BooleanLiteral(ExprBooleanLiteral {
+                node_index: AtomicNodeIndex::default(),
+                range,
+                value: has_mutation,
+            })),
+        ),
+    )
+}
+
 impl Bindings {
     #[expect(dead_code)] // Useful API
     fn len(&self) -> usize {
@@ -396,7 +521,7 @@ impl Bindings {
 
     /// Create a minimal Bindings for testing purposes.
     ///
-    /// This creates a fake module with the given name and no actual bindings,
+    /// This creates a fake module with the given name and a mutation-free wrapper summary,
     /// which is useful for creating distinguishable CalcIds in tests.
     #[cfg(test)]
     pub fn for_test(name: &str) -> Self {
@@ -409,10 +534,13 @@ impl Bindings {
         let module_path = ModulePath::filesystem(PathBuf::from(format!("/test/{}.py", name)));
         let contents = Arc::new(String::new());
         let module_info = Module::new(module_name, module_path, contents);
+        let mut table = BindingTable::default();
+        let functools_wrapper_mutation =
+            bind_functools_wrapper_mutation(&mut table, TextRange::default(), false);
         Self {
             module_info,
             sys_info: SysInfo::default(),
-            table: Default::default(),
+            table,
             metadata: Arc::new(BindingsMetadata::new()),
             module_ranges: Arc::new(ModuleRanges {
                 multi_line: Vec::new(),
@@ -420,17 +548,27 @@ impl Bindings {
                 misplaced_ignore_all: Vec::new(),
             }),
             annotated_metadata_ranges: Vec::new(),
+            docstring_type_ranges: Vec::new(),
             scope_trace: None,
             module_deletes: SmallSet::new(),
+            unset_nodes: UnsetNodes::default(),
+            global_declarations: SmallSet::new(),
+            environment_definitions: SmallMap::new(),
+            environment_names: SmallSet::new(),
             unused_imports: Vec::new(),
             unused_variables: Vec::new(),
             pytest_info: None,
+            setattr_name_literals: Vec::new(),
             lambda_yield_keys: Vec::new(),
             owned_lambda_params: SmallMap::new(),
+            lambda_parameter_derived: OnceLock::new(),
             class_scopes: Vec::new(),
+            call_base_classes: Vec::new(),
+            class_field_definitions: SmallMap::new(),
             shape_declarations: ShapeDeclarations::default(),
             subsequently_initialized: SmallSet::new(),
             promote_ranges: SmallSet::new(),
+            functools_wrapper_mutation,
         }
     }
 
@@ -443,6 +581,13 @@ impl Bindings {
 
     pub fn module(&self) -> &ModuleInfo {
         &self.module_info
+    }
+
+    /// The summary covers the whole module, including calls before a mutator and unrelated functions.
+    /// Without object alias tracking, captured wrapped targets cannot be trusted in such a module.
+    /// Stored factory applications, arbitrary attribute writes, and cross-module effects are not tracked.
+    pub fn functools_wrapper_mutation(&self) -> Idx<Key> {
+        self.functools_wrapper_mutation
     }
 
     pub fn sys_info(&self) -> &SysInfo {
@@ -462,10 +607,13 @@ impl Bindings {
     /// of metadata, like jaxtyping shapes or pydantic's `Field(...)`, report while solving the
     /// annotation.
     pub fn in_annotated_metadata(&self, range: TextRange) -> bool {
-        let idx = self
-            .annotated_metadata_ranges
-            .partition_point(|r| r.start() <= range.start());
-        idx > 0 && self.annotated_metadata_ranges[idx - 1].contains_range(range)
+        ranges_contain(&self.annotated_metadata_ranges, range)
+    }
+
+    /// Whether `range` lies inside a type that was read from a docstring. Such a type is not part
+    /// of the AST, so IDE features that find references by scanning the AST do not see it.
+    pub fn in_docstring_type(&self, range: TextRange) -> bool {
+        ranges_contain(&self.docstring_type_ranges, range)
     }
 
     /// Look up pre-computed class fields by `ClassDefIndex`. O(1) Vec index.
@@ -473,6 +621,11 @@ impl Bindings {
     /// index after incremental rebuild).
     pub fn get_class_fields(&self, idx: ClassDefIndex) -> Option<&ClassFields> {
         Some(&self.metadata.get_class_checked(idx)?.fields)
+    }
+
+    /// The class field owned by a class-body definition, excluding captures from other scopes.
+    pub(crate) fn class_field_for_definition(&self, idx: Idx<Key>) -> Option<&KeyClassField> {
+        self.class_field_definitions.get(&idx)
     }
 
     /// Per-module class index for a class definition statement (`ClassDefIndex`),
@@ -503,6 +656,10 @@ impl Bindings {
         &self.unused_variables
     }
 
+    pub(crate) fn setattr_name_literals(&self) -> &[(Identifier, TextRange)] {
+        &self.setattr_name_literals
+    }
+
     pub(crate) fn pytest_info(&self) -> Option<&PytestBindingInfo> {
         self.pytest_info.as_ref()
     }
@@ -522,6 +679,49 @@ impl Bindings {
             .map_or(&[], |params| params.as_slice())
     }
 
+    /// The ordinary lambda parameter reached by a binding's forward/narrowing source chain.
+    pub(crate) fn lambda_parameter_origin(&self, idx: Idx<Key>) -> Option<LambdaParamId> {
+        // Every ordinary LambdaParameter is registered with its enclosing expression's owner.
+        if self.owned_lambda_params.is_empty() {
+            return None;
+        }
+        self.lambda_parameter_derived
+            .get_or_init(|| {
+                let mut derived = FxHashMap::default();
+                let mut path = Vec::new();
+                for (idx, _) in self.table.types.1.iter() {
+                    let mut source = idx;
+                    let parameter = loop {
+                        if let Some(parameter) = derived.get(&source) {
+                            break *parameter;
+                        }
+                        // A source chain has one outgoing edge. Marking it before following
+                        // that edge makes a cycle terminate without an arbitrary depth cutoff.
+                        derived.insert(source, None);
+                        path.push(source);
+                        match self.table.types.1.get(source) {
+                            Some(Binding::LambdaParameter(id, _)) => break Some(*id),
+                            Some(
+                                Binding::Forward(parent)
+                                | Binding::Narrow(parent, ..)
+                                | Binding::Phi(JoinStyle::NarrowOf(parent), _),
+                            ) => source = *parent,
+                            _ => break None,
+                        }
+                    };
+                    for source in path.drain(..) {
+                        derived.insert(source, parameter);
+                    }
+                }
+                derived
+                    .into_iter()
+                    .filter_map(|(idx, parameter)| parameter.map(|parameter| (idx, parameter)))
+                    .collect()
+            })
+            .get(&idx)
+            .copied()
+    }
+
     /// Returns the innermost class whose body range contains `range`, or
     /// `None` if `range` is not inside any class body. Used by the solver
     /// to anchor `typing.Self` references to the enclosing class.
@@ -536,6 +736,19 @@ impl Bindings {
             .map(|(_, idx)| *idx)
     }
 
+    /// Whether this module contains any ordinary call-expression bases.
+    pub(crate) fn has_call_bases(&self) -> bool {
+        !self.call_base_classes.is_empty()
+    }
+
+    /// Returns the class whose base class list holds the call expression containing `range`.
+    pub(crate) fn call_base_class(&self, range: TextRange) -> Option<ClassDefIndex> {
+        self.call_base_classes
+            .iter()
+            .find(|(r, _)| r.contains_range(range))
+            .map(|(_, idx)| *idx)
+    }
+
     /// Returns `true` if the given annotation-only declaration was subsequently
     /// initialized by a non-annotated assignment (tuple unpacking, walrus, `with … as`).
     pub fn subsequently_initialized(&self, ann: Idx<KeyAnnotation>) -> bool {
@@ -545,6 +758,29 @@ impl Bindings {
     /// Names `del`eted at module scope.
     pub fn module_deletes(&self) -> &SmallSet<Name> {
         &self.module_deletes
+    }
+
+    pub fn unset_nodes(&self) -> &UnsetNodes {
+        &self.unset_nodes
+    }
+
+    /// Names that a function or class body declares `global`, and so may rebind or delete.
+    pub fn global_declarations(&self) -> &SmallSet<Name> {
+        &self.global_declarations
+    }
+
+    /// Definitions in the suites of an `if` from its first test of the environment onward, each
+    /// with the range of the innermost such clause, which for an `if` clause is the whole
+    /// statement. Another configuration would replace the definitions with another definition or
+    /// none, except for a read inside the same clause, which exists exactly when they do.
+    pub fn environment_definitions(&self) -> &SmallMap<Idx<Key>, TextRange> {
+        &self.environment_definitions
+    }
+
+    /// Names that a suite defines when the configuration rules it out by a test of the
+    /// environment. Another configuration may see that definition instead of the bound one.
+    pub fn environment_names(&self) -> &SmallSet<Name> {
+        &self.environment_names
     }
 
     pub fn available_definitions(&self, position: TextSize) -> SmallSet<Idx<Key>> {
@@ -715,7 +951,9 @@ impl Bindings {
         analyze_unannotated_for_ide: bool,
         infer_return_types: InferReturnTypes,
         treat_all_caps_as_final: bool,
+        infer_param_types_from_docstring: bool,
     ) -> Self {
+        let module_range = x.range;
         let pytest_info = PytestBindingInfo::from_module(&x);
         // Compute module ranges from the AST before consuming it. These are
         // needed later for error collection, which runs after the AST may
@@ -724,6 +962,7 @@ impl Bindings {
         let mut builder = BindingsBuilder {
             module_info: module_info.dupe(),
             annotated_metadata_ranges: Vec::new(),
+            docstring_type_ranges: Vec::new(),
             lookup,
             sys_info,
             errors,
@@ -734,29 +973,39 @@ impl Bindings {
             await_context: AwaitContext::General,
             has_docstring: Ast::has_docstring(&x),
             scopes: Scopes::module(x.range, enable_trace, module_info.path().is_interface()),
+            track_classmethod_uses: false,
             table: Default::default(),
             check_unannotated_defs,
             analyze_unannotated_for_ide,
             infer_return_types,
             treat_all_caps_as_final,
+            infer_param_types_from_docstring,
             unused_imports: Vec::new(),
             unused_variables: Vec::new(),
             django_relation_classes: Vec::new(),
             semantic_checker: SemanticSyntaxChecker::new(),
             semantic_syntax_errors: RefCell::new(Vec::new()),
             pytest_info,
+            global_declarations: SmallSet::new(),
+            environment_definitions: SmallMap::new(),
+            environment_names: SmallSet::new(),
             deferred_bound_names: SmallMap::new(),
             lambda_yield_keys: Vec::new(),
             owned_lambda_params: SmallMap::new(),
             next_lambda_param_id: 0,
+            setattr_name_literals: enable_trace.then(Vec::new),
             class_scopes: Vec::new(),
+            call_base_classes: Vec::new(),
+            class_field_definitions: SmallMap::new(),
             shape_declarations: ShapeDeclarations::default(),
             shape_comments: ShapeComments::new(&x, &module_info, errors),
             shape_string_annotation: None,
             subsequently_initialized: SmallSet::new(),
             adjacent_namedtuple_defaults: None,
             promote_ranges: SmallSet::new(),
+            has_functools_wrapper_mutation: false,
             type_checking_depth: 0,
+            environment_suite: None,
             in_unreachable_suite: false,
             pending_gate: None,
         };
@@ -810,7 +1059,7 @@ impl Bindings {
 
         let unused_imports = builder.scopes.collect_module_unused_imports();
         builder.record_unused_imports(unused_imports);
-        let scope_trace = builder.scopes.finish();
+        let (scope_trace, unset_nodes) = builder.scopes.finish();
 
         let semantic_errors = builder.semantic_syntax_errors.into_inner();
         for error in semantic_errors {
@@ -869,6 +1118,11 @@ impl Bindings {
             }
         }
         let module_deletes = scope_trace.module_deletes().clone();
+        let functools_wrapper_mutation = bind_functools_wrapper_mutation(
+            &mut builder.table,
+            module_range,
+            builder.has_functools_wrapper_mutation,
+        );
         builder.table.insert(
             KeyDjangoRelations,
             BindingDjangoRelations {
@@ -882,21 +1136,31 @@ impl Bindings {
             metadata: Arc::new(builder.metadata),
             module_ranges,
             annotated_metadata_ranges: merge_ranges(builder.annotated_metadata_ranges),
+            docstring_type_ranges: merge_ranges(builder.docstring_type_ranges),
             scope_trace: if enable_trace {
                 Some(scope_trace)
             } else {
                 None
             },
             module_deletes,
+            unset_nodes,
+            global_declarations: builder.global_declarations,
+            environment_definitions: builder.environment_definitions,
+            environment_names: builder.environment_names,
             unused_imports: builder.unused_imports,
             unused_variables: builder.unused_variables,
             pytest_info: builder.pytest_info,
+            setattr_name_literals: builder.setattr_name_literals.unwrap_or_default(),
             lambda_yield_keys: builder.lambda_yield_keys,
             owned_lambda_params: builder.owned_lambda_params,
+            lambda_parameter_derived: OnceLock::new(),
             class_scopes: builder.class_scopes,
+            call_base_classes: builder.call_base_classes,
+            class_field_definitions: builder.class_field_definitions,
             shape_declarations: builder.shape_declarations.finish(),
             subsequently_initialized: builder.subsequently_initialized,
             promote_ranges: builder.promote_ranges,
+            functools_wrapper_mutation,
         }
     }
 
@@ -1134,7 +1398,7 @@ impl<'a> BindingsBuilder<'a> {
         matches!(self.idx_to_binding(idx), Some(Binding::ClassDef(..)))
     }
 
-    fn idx_to_binding_mut<K>(&mut self, idx: Idx<K>) -> Option<&mut K::Value>
+    pub(super) fn idx_to_binding_mut<K>(&mut self, idx: Idx<K>) -> Option<&mut K::Value>
     where
         K: Keyed,
         BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
@@ -1326,6 +1590,35 @@ impl<'a> BindingsBuilder<'a> {
     /// Insert a binding into the bindings table using the current idx from a `CurrentIdx` wrapper.
     pub fn insert_binding_current(&mut self, current: CurrentIdx, value: Binding) -> Idx<Key> {
         self.insert_binding_idx(current.into_idx(), value)
+    }
+
+    /// Record the names that a suite defines, or star-imports, when the configuration rules the
+    /// suite out by a test of the environment, without binding the suite. Names are recorded for
+    /// the whole module, whatever scope the suite is in, which can only keep more tests from
+    /// settling.
+    pub fn record_environment_names(&mut self, body: &[Stmt]) {
+        let definitions = Definitions::new(
+            body,
+            self.module_info.name(),
+            self.module_info.path().is_init(),
+            self.sys_info.dupe(),
+        );
+        // The scan rules out nested suites by the configuration too, and records what they define.
+        self.environment_names.extend(
+            definitions
+                .definitions
+                .into_keys()
+                .chain(definitions.environment_names),
+        );
+        for module in definitions
+            .import_all
+            .into_keys()
+            .chain(definitions.environment_import_all)
+        {
+            if let Some(wildcard) = self.lookup.get_wildcard(module) {
+                self.environment_names.extend(wildcard.iter().cloned());
+            }
+        }
     }
 
     /// Record that an annotation-only declaration was subsequently initialized by a non-annotated assignment.
@@ -1619,12 +1912,14 @@ impl<'a> BindingsBuilder<'a> {
         }
     }
 
-    // Only works for things with `Foo`, or `source.Foo`, or `F` where `from module import Foo as F`.
-    // Does not work for things with nested modules - but no SpecialExport's have that.
+    /// Recognize a special export referenced by a name or a single module attribute.
+    /// Recorded reads use their original bindings; an unresolved recorded read never falls
+    /// back to the current scope. Reads not yet bound are resolved from the current scope.
     pub fn as_special_export(&self, e: &Expr) -> Option<SpecialExport> {
         let mut visited_names: SmallSet<Name> = SmallSet::new();
         let mut visited_keys: SmallSet<Idx<Key>> = SmallSet::new();
-        self.as_special_export_inner(e, &mut visited_names, &mut visited_keys)
+        let mut resolved = SmallMap::new();
+        self.as_special_export_inner(e, &mut visited_names, &mut visited_keys, &mut resolved)
     }
 
     pub fn class_object_is_generic(&self, idx: Idx<Key>) -> bool {
@@ -1644,26 +1939,103 @@ impl<'a> BindingsBuilder<'a> {
         e: &Expr,
         visited_names: &mut SmallSet<Name>,
         visited_keys: &mut SmallSet<Idx<Key>>,
+        resolved: &mut SmallMap<Idx<Key>, SpecialExport>,
     ) -> Option<SpecialExport> {
         match e {
             Expr::Name(name) => {
+                if let Some(idx) = self.binding_idx_at_name_read(ShortIdentifier::expr_name(name)) {
+                    // Recorded reads retain their original value even when the name is rebound.
+                    // Binding keys, rather than symbolic names, identify cycles on this path.
+                    return self.special_export_from_binding_idx(
+                        idx,
+                        visited_names,
+                        visited_keys,
+                        resolved,
+                    );
+                }
                 if !visited_names.insert(name.id.clone()) {
                     return None;
                 }
                 self.scopes
                     .as_special_export(&name.id, None, self.module_info.name(), self.lookup)
                     .or_else(|| {
-                        self.special_export_via_alias(&name.id, visited_names, visited_keys)
+                        self.special_export_via_alias(
+                            &name.id,
+                            visited_names,
+                            visited_keys,
+                            resolved,
+                        )
                     })
             }
             Expr::Attribute(ExprAttribute {
                 value, attr: name, ..
-            }) if let Expr::Name(base_name) = &**value => self.scopes.as_special_export(
-                &name.id,
-                Some(&base_name.id),
-                self.module_info.name(),
-                self.lookup,
-            ),
+            }) if let Expr::Name(base_name) = &**value => {
+                if let Some(idx) =
+                    self.binding_idx_at_name_read(ShortIdentifier::expr_name(base_name))
+                {
+                    let mut idx = idx;
+                    for _ in 0..16 {
+                        let (_, Some(binding)) = self.get_original_binding(idx)? else {
+                            return None;
+                        };
+                        if let Some(parent) = self.special_export_identity_parent(binding) {
+                            idx = parent;
+                            continue;
+                        }
+                        match binding {
+                            Binding::Module(module) => {
+                                return self.lookup.is_special_export(
+                                    ModuleName::from_parts(module.1.iter()),
+                                    &name.id,
+                                );
+                            }
+                            Binding::Import(import) => {
+                                return self.lookup.is_special_export(
+                                    self.from_import_submodule(import)?,
+                                    &name.id,
+                                );
+                            }
+                            _ => return None,
+                        }
+                    }
+                    return None;
+                }
+                self.scopes.as_special_export(
+                    &name.id,
+                    Some(&base_name.id),
+                    self.module_info.name(),
+                    self.lookup,
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// Return the fallback submodule using the solver's export-first import precedence.
+    /// Imports whose names were already verified are exports, not fallback submodules.
+    fn from_import_submodule(&self, import: &ImportBinding) -> Option<ModuleName> {
+        if import.fallback.is_none()
+            || (import.module != self.module_info.name()
+                && self.lookup.export_exists(import.module, &import.name))
+        {
+            return None;
+        }
+        let module = import.module.append(&import.name);
+        self.lookup.module_exists(module).finding()?;
+        Some(module)
+    }
+
+    /// Return an available parent binding when a wrapper preserves runtime identity.
+    fn special_export_identity_parent(&self, binding: &Binding) -> Option<Idx<Key>> {
+        match binding {
+            Binding::Forward(idx)
+            | Binding::PromoteForward(idx)
+            | Binding::ForwardToFirstUse(idx)
+            | Binding::Narrow(idx, ..)
+            | Binding::Phi(JoinStyle::NarrowOf(idx), _) => Some(*idx),
+            Binding::PossibleLegacyTParam(tparam_idx, ..) => {
+                self.idx_to_binding(*tparam_idx).map(|tparam| tparam.idx())
+            }
             _ => None,
         }
     }
@@ -1673,6 +2045,7 @@ impl<'a> BindingsBuilder<'a> {
         name: &Name,
         visited_names: &mut SmallSet<Name>,
         visited_keys: &mut SmallSet<Idx<Key>>,
+        resolved: &mut SmallMap<Idx<Key>, SpecialExport>,
     ) -> Option<SpecialExport> {
         let (idx, style) = self.scopes.binding_idx_for_name(name)?;
         match style {
@@ -1681,7 +2054,7 @@ impl<'a> BindingsBuilder<'a> {
             | FlowStyle::PossiblyUninitialized
             | FlowStyle::MaybeInitialized(_)
             | FlowStyle::Uninitialized => {
-                self.special_export_from_binding_idx(idx, visited_names, visited_keys)
+                self.special_export_from_binding_idx(idx, visited_names, visited_keys, resolved)
             }
             FlowStyle::MergeableImport(_)
             | FlowStyle::Import(..)
@@ -1701,18 +2074,18 @@ impl<'a> BindingsBuilder<'a> {
         mut idx: Idx<Key>,
         visited_names: &mut SmallSet<Name>,
         visited_keys: &mut SmallSet<Idx<Key>>,
+        resolved: &mut SmallMap<Idx<Key>, SpecialExport>,
     ) -> Option<SpecialExport> {
         for _ in 0..16 {
             if !visited_keys.insert(idx) {
                 return None;
             }
             let binding = self.idx_to_binding(idx)?;
+            if let Some(parent) = self.special_export_identity_parent(binding) {
+                idx = parent;
+                continue;
+            }
             match binding {
-                Binding::Forward(inner_idx)
-                | Binding::PromoteForward(inner_idx)
-                | Binding::ForwardToFirstUse(inner_idx) => {
-                    idx = *inner_idx;
-                }
                 Binding::NameAssign(x) => {
                     // Receiver-constrained class assignments rebind a
                     // class-shaped name; the receiver semantics keep the
@@ -1721,7 +2094,12 @@ impl<'a> BindingsBuilder<'a> {
                     if x.receiver_idx.is_some() {
                         return None;
                     }
-                    return self.as_special_export_inner(&x.expr, visited_names, visited_keys);
+                    return self.as_special_export_inner(
+                        &x.expr,
+                        visited_names,
+                        visited_keys,
+                        resolved,
+                    );
                 }
                 Binding::Import(x) => {
                     return self.lookup.is_special_export(x.module, &x.name);
@@ -1735,20 +2113,33 @@ impl<'a> BindingsBuilder<'a> {
                     return SpecialExport::new(name);
                 }
                 Binding::Phi(_, branches) => {
-                    // Check all branches for a consistent special export (e.g. try/except
-                    // importing Literal from typing vs typing_extensions).
+                    // Every branch must resolve to the same special export (e.g. try/except
+                    // importing Literal from typing vs typing_extensions). A branch that is
+                    // not a special export means the name may be an ordinary object.
                     let mut result = None;
                     for branch in branches {
-                        let branch_result = self.special_export_from_binding_idx(
-                            branch.value_key,
-                            visited_names,
-                            visited_keys,
-                        );
-                        match (&result, &branch_result) {
-                            (None, _) => result = branch_result,
-                            (_, None) => {}
-                            (Some(a), Some(b)) if a == b => {}
-                            _ => return None,
+                        let branch_result = if let Some(export) = resolved.get(&branch.value_key) {
+                            *export
+                        } else {
+                            // Siblings may share ancestors without forming a cycle. Each branch
+                            // inherits only the bindings and names on the current traversal path.
+                            let mut branch_names = visited_names.clone();
+                            let mut branch_keys = visited_keys.clone();
+                            let export = self.special_export_from_binding_idx(
+                                branch.value_key,
+                                &mut branch_names,
+                                &mut branch_keys,
+                                resolved,
+                            )?;
+                            // Only successful resolutions are reusable: failures can depend on
+                            // the current path, whereas a resolved branch has checked every leaf.
+                            resolved.insert(branch.value_key, export);
+                            export
+                        };
+                        match result {
+                            None => result = Some(branch_result),
+                            Some(expected) if expected == branch_result => {}
+                            Some(_) => return None,
                         }
                     }
                     return result;
@@ -1793,6 +2184,12 @@ impl<'a> BindingsBuilder<'a> {
     }
 
     pub fn declare_mutable_capture(&mut self, name: &Identifier, kind: MutableCaptureKind) {
+        // At module scope, `global` changes nothing.
+        if matches!(kind, MutableCaptureKind::Global)
+            && (self.scopes.in_class_body() || !self.scopes.in_module_or_class_top_level())
+        {
+            self.global_declarations.insert(name.id.clone());
+        }
         // Record any errors finding the identity of the mutable capture, and get a binding
         // that provides the type coming from the parent scope.
         let binding = match self
@@ -1896,7 +2293,7 @@ impl<'a> BindingsBuilder<'a> {
                 // Mark as used (this must happen during traversal for unused-variable detection)
                 self.scopes.mark_parameter_used(name.key());
                 self.scopes.mark_import_used(name.key());
-                self.scopes.mark_variable_used(name.key());
+                self.scopes.mark_variable_used(name.key(), value_idx);
                 if !usage.is_static()
                     && matches!(
                         initialized,
@@ -1931,7 +2328,7 @@ impl<'a> BindingsBuilder<'a> {
             } => {
                 self.scopes.mark_parameter_used(name.key());
                 self.scopes.mark_import_used(name.key());
-                self.scopes.mark_variable_used(name.key());
+                self.scopes.mark_variable_used(name.key(), None);
                 let idx = self.idx_for_promise(key);
                 if let Some(module) = implicit_builtin_module {
                     self.insert_implicit_builtin_binding(idx, module, name.key());
@@ -2027,6 +2424,14 @@ impl<'a> BindingsBuilder<'a> {
             "a BoundName is deferred only once"
         );
         bound_name_idx
+    }
+
+    /// Return the binding captured for an already-bound read.
+    /// Static and implicit-builtin reads use their lookup binding when no flow value was recorded.
+    fn binding_idx_at_name_read(&self, name: ShortIdentifier) -> Option<Idx<Key>> {
+        self.deferred_bound_names
+            .get(&name)
+            .map(|read| read.value_idx.unwrap_or(read.lookup_result_idx))
     }
 
     /// Return the unnarrowed value binding captured for this exact name read.
@@ -2286,6 +2691,12 @@ impl<'a> BindingsBuilder<'a> {
         if name.is_empty() {
             return None;
         }
+        if let Some(class_index) = self.scopes.current_class_field_owner(name)
+            && matches!(self.idx_to_key(idx), Key::Definition(_))
+        {
+            self.class_field_definitions
+                .insert(idx, KeyClassField(class_index, name.clone()));
+        }
         // Suppress the ALL_CAPS check when a more specific check already reported
         // on this reassignment, to avoid emitting two overlapping errors. Both
         // checks are always run so their own diagnostics are unaffected.
@@ -2293,6 +2704,9 @@ impl<'a> BindingsBuilder<'a> {
         let imported_final_reported = self.check_for_imported_final_reassignment(name, idx);
         if !type_alias_reported && !imported_final_reported {
             self.check_for_all_caps_final_reassignment(name, idx);
+        }
+        if let Some(suite) = self.environment_suite {
+            self.environment_definitions.insert(idx, suite);
         }
         let name = Hashed::new(name);
         let write_info = self
@@ -2636,11 +3050,23 @@ impl<'a> BindingsBuilder<'a> {
                 )
             })
         };
+        // `bind_docstring_param_types` binds the docstring type under the key that an explicit
+        // annotation would use, so only an unannotated parameter can find one here.
+        let docstring_annot = if annot.is_none() && !ignore_annotation {
+            self.promised_idx(&KeyAnnotation::Annotation(ShortIdentifier::new(name)))
+        } else {
+            None
+        };
         let key = self.insert_binding(
             Key::Definition(ShortIdentifier::new(name)),
             Binding::FunctionParameter(Box::new(match annot {
                 Some(annot) => FunctionParameter::Annotated(annot),
-                None => FunctionParameter::Unannotated(undecorated_idx, target, name.id.clone()),
+                None => FunctionParameter::Unannotated(
+                    undecorated_idx,
+                    target,
+                    name.id.clone(),
+                    docstring_annot,
+                ),
             })),
         );
         self.scopes.add_parameter_to_current_static(name, annot);

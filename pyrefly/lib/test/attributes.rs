@@ -7,8 +7,79 @@
 
 // @lint-ignore-every SPELL deliberately testing bad spelling
 
+use crate::state::require::Require;
 use crate::test::util::TestEnv;
 use crate::testcase;
+
+testcase!(
+    test_setattr_inferred_instance_attributes,
+    r#"
+from typing import Final, assert_type
+
+class Plain:
+    def __init__(self) -> None:
+        object.__setattr__(self, "x", 1)
+        setattr(self, "y", "hello")
+
+assert_type(Plain().x, int)
+assert_type(Plain().y, str)
+
+class FinalField:
+    x: Final[int]
+    def __init__(self) -> None:
+        object.__setattr__(self, "x", 1)
+
+assert_type(FinalField().x, int)
+
+class Starred:
+    def __init__(self) -> None:
+        object.__setattr__(self, "x", *[1])
+        setattr(self, "y", *[1])
+
+_ = Starred().x  # E: Object of class `Starred` has no attribute `x`
+_ = Starred().y  # E: Object of class `Starred` has no attribute `y`
+"#,
+);
+
+testcase!(
+    test_setattr_classmethod_attribute_parity,
+    r#"
+from typing import assert_type
+
+class TestDirect:
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.x = 1
+
+class TestSetattr:
+    @classmethod
+    def setUpClass(cls) -> None:
+        setattr(cls, "x", 1)
+
+assert_type(TestDirect.x, int)
+assert_type(TestDirect().x, int)
+assert_type(TestSetattr.x, int)
+assert_type(TestSetattr().x, int)
+"#,
+);
+
+testcase!(
+    test_setattr_classmethod_attribute_boundaries,
+    TestEnv::new().enable_implicitly_defined_attribute_error(),
+    r#"
+from typing import assert_type
+
+class ClsSetattr:
+    @classmethod
+    def setup(cls) -> None:
+        setattr(cls, "x", 1)  # E: Attribute `x` is implicitly defined by assignment in method `setup`, which is not a constructor
+        object.__setattr__(cls, "y", 1)
+
+def check(c: ClsSetattr) -> None:
+    assert_type(c.x, int)
+    _ = c.y  # E: Object of class `ClsSetattr` has no attribute `y`
+"#,
+);
 
 testcase!(
     test_class_body_initialization_is_independent_of_methods,
@@ -107,6 +178,39 @@ class EarlyReturn:
         if flag:
             return
         self.value = 1
+        stop()
+"#,
+);
+
+// A path on which the attribute is unset reaches the end of the class body only if every branch
+// it passes through completes.
+testcase!(
+    test_class_attribute_unset_path_cut_off_by_later_branch,
+    TestEnv::new().enable_possibly_uninitialized_attribute_error(),
+    r#"
+from typing import NoReturn
+
+def stop() -> NoReturn: ...
+def coin() -> bool: ...
+
+class CutOff:
+    if coin():
+        value = 1
+    else:
+        pass
+    if coin():
+        value = 2
+    else:
+        stop()
+
+class NotCutOff:
+    if coin():
+        value = 1  # E: Attribute `value` may be uninitialized
+    else:
+        pass
+    if coin():
+        print(0)
+    else:
         stop()
 "#,
 );
@@ -1259,6 +1363,17 @@ class A:
         self.x: int = x  # E: `str` is not assignable to attribute `x` with type `int`
 def f(a: A):
     assert_type(a.x, int)
+    "#,
+);
+
+testcase!(
+    test_self_attribute_redefinition_across_methods,
+    r#"
+class A:
+    def __init__(self) -> None:
+        self.foo: int | None = None
+    def calc_foo(self) -> None:
+        self.foo: int = 1  # E: `foo` cannot be annotated with `int`, it is already defined with type `int | None`
     "#,
 );
 
@@ -2444,6 +2559,54 @@ class C:
     __secret: int = 0
     def reveal(self, a: A):
         return a.__secret  # E: Private attribute `__secret` cannot be accessed outside of its defining class
+
+class Outer:
+    __secret: int = 0
+
+    class Inner:
+        def reveal(self, outer: "Outer") -> int:
+            return outer.__secret  # E: Private attribute `__secret` cannot be accessed outside of its defining class
+"#,
+);
+
+testcase!(
+    test_protected_attribute_access,
+    TestEnv::new().enable_protected_access_error(),
+    r#"
+class A:
+    _protected: int = 0
+
+    def reveal(self, other: "A") -> int:
+        return self._protected + other._protected
+
+outside_instance = A()._protected  # E: Protected attribute `_protected` cannot be accessed outside of its defining class or a subclass
+outside_class = A._protected  # E: Protected attribute `_protected` cannot be accessed outside of its defining class or a subclass
+
+class B(A):
+    inherited = A._protected
+
+    def reveal(self, other: A) -> int:
+        return self._protected + other._protected
+
+class Unrelated:
+    def leak(self, a: A) -> int:
+        return a._protected  # E: Protected attribute `_protected` cannot be accessed outside of its defining class or a subclass
+"#,
+);
+
+testcase!(
+    test_same_named_protected_attribute_from_unrelated_class,
+    TestEnv::new().enable_protected_access_error(),
+    r#"
+class A:
+    _protected: int = 0
+
+class B(A):
+    def leak(self, other: "Unrelated") -> int:
+        return other._protected  # E: Protected attribute `_protected` cannot be accessed outside of its defining class or a subclass
+
+class Unrelated:
+    _protected: int = 0
 "#,
 );
 
@@ -2509,6 +2672,17 @@ class A:
         def get():
             return self.__secret
         return get()
+    "#,
+);
+
+testcase!(
+    test_private_attribute_in_lambda_and_comprehension_in_class_body,
+    r#"
+class A:
+    __secret: int = 0
+    instances: list["A"] = []
+    secrets = [a.__secret for a in instances]
+    get_secret = lambda: A.__secret
     "#,
 );
 
@@ -4357,6 +4531,210 @@ def use(obj, a: Any, c: C) -> None:
 "#,
 );
 
+testcase!(
+    test_protected_attribute_ignored_by_default,
+    r#"
+class A:
+    _protected: int = 0
+
+value = A()._protected
+"#,
+);
+
+testcase!(
+    test_protected_attribute_dynamic_values,
+    TestEnv::new().enable_protected_access_error(),
+    r#"
+from typing import Any
+
+class Dynamic:
+    def __getattr__(self, name: str) -> Any: ...
+
+def outside(value: Any, cls: type[Any], dynamic: Dynamic):
+    value._protected
+    cls._protected
+    dynamic._protected
+
+class A:
+    _protected: int = 0
+
+    def inside(self, value: Any, cls: type[Any], dynamic: Dynamic):
+        value._protected
+        cls._protected
+        dynamic._protected
+"#,
+);
+
+testcase!(
+    test_protected_attribute_from_stub,
+    {
+        let mut env = TestEnv::new().enable_protected_access_error();
+        env.add("source", "class SourceBase:\n    _protected: int = 0\n");
+        env.add_with_path(
+            "lib",
+            "lib.pyi",
+            "from source import SourceBase\nclass A:\n    _protected: int\n    __private: int\nclass StubDerived(SourceBase): ...\n",
+        );
+        env
+    },
+    r#"
+from lib import A, StubDerived
+
+value = A()._protected
+A()._protected = 1
+A().__private  # E: Private attribute `__private` cannot be accessed outside of its defining class
+StubDerived()._protected  # E: Protected attribute `_protected` cannot be accessed outside of its defining class or a subclass
+
+class B:
+    def method(self, value: A):
+        return value._protected
+
+class Derived(A):
+    pass
+
+inherited = Derived()._protected
+
+class Override(A):
+    _protected: int = 1
+
+Override()._protected  # E: Protected attribute `_protected` cannot be accessed outside of its defining class or a subclass
+
+class Source:
+    _protected: int = 1
+
+def read(value: A | Source) -> int:
+    return value._protected  # E: Protected attribute `_protected` cannot be accessed outside of its defining class or a subclass
+"#,
+);
+
+testcase!(
+    test_protected_attribute_on_bounded_type_variable,
+    TestEnv::new().enable_protected_access_error(),
+    r#"
+class A:
+    _protected: int = 0
+
+    def read[T: A](self, other: T) -> int:
+        return other._protected
+"#,
+);
+
+testcase!(
+    test_protected_attribute_quoted_cast_default,
+    r#"
+from typing import Any, assert_type, cast
+
+class Owner:
+    _value: int = 1
+
+def read(value: Any) -> None:
+    assert_type(cast("Owner", value)._value, int)
+    assert_type(cast(Owner, value)._value, int)
+"#,
+);
+
+testcase!(
+    test_protected_attribute_quoted_cast_enabled,
+    TestEnv::new().enable_protected_access_error(),
+    r#"
+from typing import Any, cast
+
+class Owner:
+    _value: int = 1
+
+def read(value: Any) -> None:
+    cast("Owner", value)._value  # E: Protected attribute `_value` cannot be accessed outside of its defining class or a subclass
+    cast(Owner, value)._value  # E: Protected attribute `_value` cannot be accessed outside of its defining class or a subclass
+"#,
+);
+
+testcase!(
+    test_protected_attribute_named_tuple_public_api,
+    TestEnv::new().enable_protected_access_error(),
+    r#"
+from collections import namedtuple
+from typing import NamedTuple
+from urllib.parse import urlsplit
+
+class Record(NamedTuple):
+    value: int
+
+    def _internal(self) -> int:
+        return self.value
+
+record = Record(1)
+record._replace(value=2)
+record._asdict()
+Record._make([1])
+record._fields
+Record._field_defaults
+record._internal()  # E: Protected attribute `_internal` cannot be accessed outside of its defining class or a subclass
+
+Row = namedtuple("Row", ["value"])
+Row(1)._replace(value=2)
+Row(1)._asdict()
+urlsplit("https://example.com/a")._replace(scheme="file")
+
+class Other:
+    def _replace(self) -> None: ...
+
+Other()._replace()  # E: Protected attribute `_replace` cannot be accessed outside of its defining class or a subclass
+"#,
+);
+
+testcase!(
+    test_protected_attribute_enclosing_class_scopes,
+    TestEnv::new().enable_protected_access_error(),
+    r#"
+from typing import assert_type
+
+class _CodeWriter:
+    _indent: int = 1
+
+    def indent(self):
+        class Indenter:
+            def __exit__(_, *args):
+                assert_type(self._indent, int)
+        return Indenter()
+
+class Base:
+    _value: int = 1
+
+class HeaderBase:
+    def __init_subclass__(cls, flag: int) -> None: ...
+
+class InHeader(Base, HeaderBase, flag=Base._value):  # E: Protected attribute `_value` cannot be accessed outside of its defining class or a subclass
+    pass
+
+class Derived(Base):
+    class Inner:
+        value = Base._value
+
+        def read(self, other: Base) -> int:
+            def nested() -> int:
+                return other._value
+            return nested()
+
+class Container:
+    class First:
+        _value: int = 1
+
+    class Second:
+        def read(self, other: "Container.First") -> int:
+            return other._value  # E: Protected attribute `_value` cannot be accessed outside of its defining class or a subclass
+
+class Unrelated:
+    class Inner:
+        def read(self, other: Base) -> int:
+            return other._value  # E: Protected attribute `_value` cannot be accessed outside of its defining class or a subclass
+
+def outside(other: Base) -> int:
+    def nested() -> int:
+        return other._value  # E: Protected attribute `_value` cannot be accessed outside of its defining class or a subclass
+    return nested()
+"#,
+);
+
 // The exemption for conditional methods requires every binding of the name in the class body
 // to be a `def`, even when a later `def` replaces the other binding.
 testcase!(
@@ -4375,5 +4753,696 @@ class DeletedThenDefined:
         def value(self) -> int: ...  # E: Attribute `value` may be uninitialized
         del value
         def value(self) -> int: ...
+"#,
+);
+
+testcase!(
+    test_instance_var_assign_protocol_policy_default,
+    r#"
+from typing import Protocol
+
+class P(Protocol):
+    x: int
+
+class C:
+    x: int = 0
+
+def f(p: P) -> None:
+    pass
+
+f(C)  # E: Argument `type[C]` is not assignable to parameter `p` with type `P`
+f(C())
+"#,
+);
+
+testcase!(
+    test_instance_var_assign_protocol_policy_enabled,
+    TestEnv::new().enable_instance_var_assign_error(),
+    r#"
+from typing import Protocol
+
+class P(Protocol):
+    x: int
+
+class C:
+    x: int = 0
+
+def f(p: P) -> None:
+    pass
+
+f(C)  # E: Argument `type[C]` is not assignable to parameter `p` with type `P`
+f(C())
+"#,
+);
+
+// `instance-var-assign` (issue #3750): assigning to a class-body-declared
+// instance variable (annotated, not `ClassVar`) via the class object is flagged
+// when the kind is enabled. Inherited fields and fields annotated with a default
+// are still instance variables, so they are flagged too. The existing
+// bad-assignment check still runs (both fire on separate paths).
+testcase!(
+    test_instance_var_assign_diagnostic,
+    TestEnv::new().enable_instance_var_assign_error(),
+    r#"
+from typing import ClassVar
+
+class C:
+    instance_var: int
+C.instance_var = 3  # E: Cannot set instance variable `instance_var` from the class
+
+# Annotated with a default: still an instance variable per the typing spec.
+class WithDefault:
+    x: int = 3
+WithDefault.x = 4  # E: Cannot set instance variable `x` from the class
+
+# Inherited fields keep their provenance through the MRO lookup.
+class Sub(C):
+    pass
+Sub.instance_var = 5  # E: Cannot set instance variable `instance_var` from the class
+
+# A type-incompatible value yields BOTH instance-var-assign and bad-assignment.
+C.instance_var = "oops"  # E: Cannot set instance variable `instance_var` from the class  # E: `Literal['oops']` is not assignable to attribute `instance_var` with type `int`
+
+# Suppressible via the standard directive.
+C.instance_var = 7  # pyrefly: ignore[instance-var-assign]
+    "#,
+);
+
+testcase!(
+    test_instance_var_assign_typed_dict,
+    TestEnv::new().enable_instance_var_assign_error(),
+    r#"
+from typing import NotRequired, TypedDict, assert_type
+
+class TD(TypedDict):
+    x: int
+    optional: NotRequired[int]
+
+class Child(TD):
+    y: str
+
+class Grandchild(Child):
+    pass
+
+assert_type(TD.x, int)
+TD.x = 1  # E: Cannot set instance variable `x` from the class
+Child.x = 2  # E: Cannot set instance variable `x` from the class
+Grandchild.x = 3  # E: Cannot set instance variable `x` from the class
+Child.y = "value"  # E: Cannot set instance variable `y` from the class
+TD.optional = 4  # E: Cannot set instance variable `optional` from the class
+TD.x = "oops"  # E: Cannot set instance variable `x` from the class  # E: `Literal['oops']` is not assignable to attribute `x` with type `int`
+TD.x = 5  # pyrefly: ignore[instance-var-assign]
+
+class Partial(TypedDict, total=False):
+    x: int
+
+Partial.x = 6  # E: Cannot set instance variable `x` from the class
+
+# Reads and dictionary-item writes are unaffected.
+td: TD = {"x": 1}
+assert_type(td["x"], int)
+td["x"] = 2
+
+class Metadata(TypedDict):
+    __module__: str
+    __doc__: str | None
+    __annotations__: dict[str, object]
+
+Metadata.__module__ = "renamed"
+Metadata.__doc__ = "Documentation"
+Metadata.__annotations__ = {}
+
+class MetadataChild(Metadata):
+    pass
+
+MetadataChild.__module__ = "renamed"
+MetadataChild.__doc__ = None
+MetadataChild.__annotations__ = {}
+"#,
+);
+
+// Non-instance-variable fields must NOT trigger the new kind even when it is
+// enabled: unannotated assignments and ClassVars are class variables,
+// staticmethods become unannotated ClassAttributes, instance-only attributes
+// keep their existing no-access error, and instance writes are unaffected.
+testcase!(
+    test_instance_var_assign_non_instance_fields_not_flagged,
+    TestEnv::new().enable_instance_var_assign_error(),
+    r#"
+from typing import ClassVar, Generic, TypeVar
+
+class C:
+    unannotated = 1
+    cv: ClassVar[int] = 2
+
+    @staticmethod
+    def stat() -> int:
+        return 3
+
+def f() -> int:
+    return 4
+
+T = TypeVar("T")
+
+
+class G(Generic[T]):
+    item: T
+
+
+C.unannotated = 5
+C.cv = 6
+C.stat = f
+
+# Writing a ClassVar via an instance keeps firing the pre-existing mirror rule.
+C().cv = 7  # E: Cannot set field `cv`
+
+# Instance-only attributes keep their pre-existing error on class access.
+class D:
+    def __init__(self) -> None:
+        self.only = 1
+D.only = 56  # E: Instance-only attribute `only` of class `D` is not visible on the class
+D().only = 57
+
+# Generic fields are unreachable via the class object (pre-existing no-access).
+G.item = 6  # E: Generic attribute `item` of class `G` is not visible on the class
+
+# Reads and instance writes never trigger this diagnostic.
+class E:
+    read_only_use: int = 1
+print(E.read_only_use)
+print(E().read_only_use)
+E().read_only_use = 2
+    "#,
+);
+
+// `instance-var-assign` is off by default: assignments that WOULD be flagged in
+// strict mode emit nothing under the default configuration.
+testcase!(
+    test_instance_var_assign_off_by_default,
+    r#"
+from typing import Literal, TypedDict, assert_type
+
+class C:
+    instance_var: int
+C.instance_var = 3
+
+class TD(TypedDict):
+    x: int
+
+class Child(TD):
+    pass
+
+TD.x = 1
+Child.x = 2
+assert_type(TD.x, Literal[1])
+assert_type(Child.x, Literal[2])
+    "#,
+);
+
+// Writes through a class object that resolve via the metaclass are metaclass-
+// instance writes and are never flagged: a class is an instance of its
+// metaclass, so assigning metaclass-declared fields (including `__name__`)
+// through the class object is valid.
+testcase!(
+    test_instance_var_assign_metaclass_writes_not_flagged,
+    TestEnv::new().enable_instance_var_assign_error(),
+    r#"
+class Meta(type):
+    meta_field: int
+
+class UsesMeta(metaclass=Meta):
+    instance_var: int
+
+UsesMeta.meta_field = 1
+UsesMeta.__name__ = "Renamed"
+
+# A plain class reads `__name__` from `type` through the metaclass fallback.
+class Plain:
+    instance_var: int
+
+Plain.__name__ = "Renamed"
+
+# Inherited metaclass fields stay metaclass-instance writes.
+class SubUsesMeta(UsesMeta):
+    pass
+
+SubUsesMeta.meta_field = 2
+    "#,
+);
+
+// Attributes created by assigning through `cls` in a classmethod are set on the
+// class itself, so they are class attributes, not class-body instance variables.
+testcase!(
+    test_instance_var_assign_classmethod_created_attr_not_flagged,
+    TestEnv::new().enable_instance_var_assign_error(),
+    r#"
+class C:
+    @classmethod
+    def make(cls) -> None:
+        cls.extra: int = 0
+
+C.extra = 1
+    "#,
+);
+
+// Class-body instance variables whose annotation is a union containing
+// descriptors keep their provenance through the descriptor-read conversion, so
+// writes via the class are still flagged.
+testcase!(
+    test_instance_var_assign_descriptor_union_flagged,
+    TestEnv::new().enable_instance_var_assign_error(),
+    r#"
+class Desc:
+    def __get__(self, instance: object, owner: type) -> int:
+        return 0
+    def __set__(self, instance: object, value: int) -> None:
+        pass
+
+class C:
+    x: "int | Desc"
+
+C.x = 1  # E: Cannot set instance variable `x` from the class
+C().x = 2
+    "#,
+);
+
+testcase!(
+    test_instance_var_assign_class_metadata,
+    TestEnv::new().enable_instance_var_assign_error(),
+    r#"
+class C:
+    pass
+
+C.__module__ = "renamed"
+C.__doc__ = "Documentation"
+C.__annotations__ = {}
+C.__name__ = "Renamed"
+C.__qualname__ = "Renamed"
+
+class Meta(type):
+    pass
+
+class Custom(metaclass=Meta):
+    pass
+
+Custom.__module__ = "renamed"
+Custom.__doc__ = "Documentation"
+Custom.__annotations__ = {}
+
+class Explicit:
+    __module__: str = "original"
+    __doc__: str | None = "Original documentation"
+    __annotations__: dict[str, object] = {}
+    ordinary: int = 0
+
+Explicit.__module__ = "renamed"
+Explicit.__doc__ = "Documentation"
+Explicit.__annotations__ = {}
+Explicit.ordinary = 1  # E: Cannot set instance variable `ordinary` from the class
+"#,
+);
+
+testcase!(
+    test_instance_var_assign_inherited_classmethod,
+    TestEnv::new().enable_instance_var_assign_error(),
+    r#"
+from typing import ClassVar
+
+class Base:
+    x: int = 0
+    cv: ClassVar[int] = 0
+
+class Child(Base):
+    @classmethod
+    def make(cls) -> None:
+        cls.x = 1  # E: Cannot set instance variable `x` from the class
+        cls.cv = 1
+        cls.fresh: int = 1
+
+Child.x = 2  # E: Cannot set instance variable `x` from the class
+Child.cv = 2
+Child.fresh = 2
+Base.x = 3  # E: Cannot set instance variable `x` from the class
+
+class Grandchild(Child):
+    @classmethod
+    def make_again(cls) -> None:
+        cls.x = 3  # E: Cannot set instance variable `x` from the class
+        cls.fresh = 3
+
+Grandchild.x = 4  # E: Cannot set instance variable `x` from the class
+Grandchild.fresh = 4
+
+class Direct(Base):
+    x: int = 0
+    @classmethod
+    def make(cls) -> None:
+        cls.x = 1  # E: Cannot set instance variable `x` from the class
+
+Direct.x = 2  # E: Cannot set instance variable `x` from the class
+"#,
+);
+
+testcase!(
+    bug = "Metaclass data descriptor reads still use class fields",
+    test_instance_var_assign_metaclass_descriptor_collision,
+    TestEnv::new().enable_instance_var_assign_error(),
+    r#"
+from typing import Literal, assert_type
+
+class Meta(type):
+    @property
+    def x(cls) -> int:
+        return 0
+    @x.setter
+    def x(cls, value: int) -> None:
+        pass
+
+class C(metaclass=Meta):
+    x: int = 0
+
+C.x = 1
+assert_type(C.x, Literal[1])
+
+class Child(C):
+    pass
+
+Child.x = 2
+assert_type(Child.x, Literal[2])
+"#,
+);
+
+testcase!(
+    test_instance_var_assign_narrowing_default,
+    r#"
+from typing import Literal, assert_type
+
+class C:
+    x: int | None = None
+
+C.x = 1
+assert_type(C.x, Literal[1])
+
+def f() -> int:
+    if C.x is None:
+        C.x = 2
+    return C.x
+"#,
+);
+
+testcase!(
+    test_instance_var_assign_narrowing_enabled,
+    TestEnv::new().enable_instance_var_assign_error(),
+    r#"
+from typing import Literal, assert_type
+
+class C:
+    x: int | None = None
+
+C.x = 1  # E: Cannot set instance variable `x` from the class
+assert_type(C.x, Literal[1])
+C.x = 2  # pyrefly: ignore[instance-var-assign]
+assert_type(C.x, Literal[2])
+
+def f() -> int:
+    if C.x is None:
+        C.x = 3  # pyrefly: ignore[instance-var-assign]
+    return C.x
+"#,
+);
+
+testcase!(
+    bug = "Metaclass data descriptor reads still use class fields",
+    test_metaclass_descriptor_kinds_precedence,
+    TestEnv::new().enable_instance_var_assign_error(),
+    r#"
+from functools import cached_property
+from typing import Literal, assert_type
+
+class Data:
+    def __get__(self, instance: object, owner: type) -> str:
+        return "data"
+    def __set__(self, instance: object, value: int) -> None:
+        pass
+
+class NonData:
+    def __get__(self, instance: object, owner: type) -> str:
+        return "non-data"
+
+class DeleteOnly:
+    def __get__(self, instance: object, owner: type) -> str:
+        return "delete-only"
+    def __delete__(self, instance: object) -> None:
+        pass
+
+class Meta(type):
+    data = Data()
+    non_data = NonData()
+    delete_only = DeleteOnly()
+    @property
+    def readonly(cls) -> str:
+        return "readonly"
+    @cached_property
+    def cached(cls) -> str:
+        return "cached"
+
+class C(metaclass=Meta):
+    data: int = 0
+    non_data: int = 0
+    delete_only: int = 0
+    readonly: int = 0
+    cached: int = 0
+
+assert_type(C.data, int)
+assert_type(C.non_data, int)
+assert_type(C.delete_only, int)
+assert_type(C.readonly, int)
+C.data = 1
+C.non_data = 1  # E: Cannot set instance variable `non_data` from the class
+C.delete_only = 1
+C.readonly = 1
+assert_type(C.cached, int)
+C.cached = 1  # E: Cannot set instance variable `cached` from the class
+assert_type(C.cached, Literal[1])
+"#,
+);
+
+testcase!(
+    test_self_attribute_repeated_compatible_annotation,
+    r#"
+class A:
+    x: int
+    def __init__(self) -> None:
+        self.x: int = 0
+    def reset(self) -> None:
+        self.x: int = 1
+class B:
+    def __init__(self) -> None:
+        self.y: int = 0
+    def reset(self) -> None:
+        self.y: int = 1
+    "#,
+);
+
+testcase!(
+    test_self_attribute_redefinition_ignores_other_receivers,
+    r#"
+class Other:
+    x: str
+class A:
+    def __init__(self) -> None:
+        self.x: int = 0
+    @staticmethod
+    def build(other: Other) -> None:
+        other.x: str = ""  # E: Cannot annotate non-self attribute `other.x`
+    def nested(self) -> None:
+        def inner(self: Other) -> None:
+            self.x: str = ""  # E: Cannot annotate non-self attribute `self.x`
+    "#,
+);
+
+testcase!(
+    test_self_attribute_redefinition_constructor_ordering,
+    r#"
+class A:
+    def reset(self) -> None:
+        self.x: int = 1  # E: `x` cannot be annotated with `int`, it is already defined with type `int | None`
+    def __init__(self) -> None:
+        self.x: int | None = None
+"#,
+);
+
+testcase!(
+    test_self_attribute_compatible_unions_and_aliases,
+    r#"
+type AliasInt = int
+class A:
+    def __init__(self) -> None:
+        self.x: int | str = 0
+        self.y: AliasInt = 0
+    def reset(self) -> None:
+        self.x: str | int = ""
+        self.y: int = 1
+"#,
+);
+
+testcase!(
+    test_self_attribute_scoped_type_alias_redefinition,
+    r#"
+class T1: ...
+class T2: ...
+class A:
+    def __init__(self) -> None:
+        T = T1
+        self.x: T
+    def reset(self) -> None:
+        T = T2
+        self.x: T  # E: `x` cannot be annotated with `T2`, it is already defined with type `T1`
+"#,
+);
+
+testcase!(
+    test_self_attribute_class_body_reannotation_and_literal_narrowing,
+    r#"
+from typing import Literal
+class A:
+    x: int
+    y: Literal[0] | Literal[1]
+    def __init__(self) -> None:
+        self.x: int = 0
+        self.y: Literal[1] = 1
+    def reset(self) -> None:
+        self.x: int = 1
+        self.y: Literal[0] = 0
+"#,
+);
+
+testcase!(
+    test_nested_method_receiver_ownership,
+    r#"
+class Outer:
+    def __init__(self) -> None:
+        self.x: int = 0
+        class Inner:
+            @staticmethod
+            def static_helper(self: str) -> None:
+                self.x = ""  # E: Object of class `str` has no attribute `x`
+            def second_param(other, self: str) -> None:
+                self.x = ""  # E: Object of class `str` has no attribute `x`
+            def captured(other) -> None:
+                self.x = 1
+        def local_capture() -> None:
+            nonlocal self
+            self.x = 2
+"#,
+);
+
+testcase!(
+    test_receiver_ownership_global_comprehension_and_nonlocal_method,
+    r#"
+from typing import Final
+class Other:
+    x: int
+    y: int
+self = Other()
+class A:
+    z: Final[int]
+    def __init__(self) -> None:
+        self.z = 0
+        def uses_global() -> None:
+            global self
+            self.x: int = 1  # E: Cannot annotate non-self attribute `self.x`
+        _ = [0 for self in [Other()] for self.y in [1]]
+        class Inner:
+            def method(other) -> None:
+                nonlocal self
+                self.z = 2  # E: Cannot set field `z`
+_ = A().y  # E: Object of class `A` has no attribute `y`
+"#,
+);
+
+testcase!(
+    test_final_attribute_nested_permissions,
+    r#"
+from typing import Final
+class A:
+    x: Final[int]
+    def __init__(self) -> None:
+        self.x = 0
+        def helper() -> None:
+            self.x = 1
+        def helper_nonlocal() -> None:
+            nonlocal self
+            self.x = 2
+        class Inner:
+            def method(inner_self) -> None:
+                def f() -> None:
+                    self.x = 4  # E: Cannot set field `x`
+                f()
+            @staticmethod
+            def static_fn(self: A) -> None:
+                self.x = 3  # E: Cannot set field `x`
+"#,
+);
+
+testcase!(
+    test_no_type_check_staticmethod_skipped_body,
+    r#"
+from typing import no_type_check
+class A:
+    @no_type_check
+    @staticmethod
+    def static_func(self) -> None:
+        self.phantom = 1
+    @no_type_check
+    def normal_func(self) -> None:
+        self.real = 2
+
+a = A()
+_ = a.phantom  # E: Object of class `A` has no attribute `phantom`
+_ = a.real
+"#,
+);
+
+testcase!(
+    test_explicit_staticmethod_new_receiver,
+    r#"
+class C:
+    @staticmethod
+    def __new__(cls) -> "C":
+        cls.x: int = 0
+        return super().__new__(cls)
+
+_ = C().x
+"#,
+);
+
+testcase!(
+    test_explicit_staticmethod_new_no_type_check,
+    r#"
+from typing import no_type_check
+
+class C:
+    @no_type_check
+    @staticmethod
+    def __new__(cls) -> "C":
+        cls.x = 1
+        return super().__new__(cls)
+
+_ = C().x
+"#,
+);
+
+testcase!(
+    test_explicit_staticmethod_new_batch_skipped,
+    TestEnv::new_skip_check_no_infer().with_run_require(Require::Errors),
+    r#"
+class C:
+    @staticmethod
+    def __new__(cls):
+        cls.x = 1
+        return super().__new__(cls)
+
+_ = C().x
 "#,
 );

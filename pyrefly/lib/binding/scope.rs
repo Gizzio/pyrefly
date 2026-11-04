@@ -72,6 +72,9 @@ use crate::binding::bindings::BindingTable;
 use crate::binding::bindings::BindingsBuilder;
 use crate::binding::bindings::CurrentIdx;
 use crate::binding::bindings::InitializedInFlow;
+use crate::binding::bindings::UnsetNodeId;
+use crate::binding::bindings::UnsetNodes;
+use crate::binding::classmethod::ClassmethodReceiverState;
 use crate::binding::expr::Usage;
 use crate::binding::function::SelfAssignments;
 use crate::binding::narrow::ExcludedNonePair;
@@ -599,7 +602,7 @@ impl Static {
         let final_string_values = d
             .final_names
             .into_iter()
-            .filter_map(|(name, value)| value.map(|v| (name, v)))
+            .filter_map(|(name, final_name)| final_name.string_value.map(|v| (name, v)))
             .collect();
         (
             implicit_captures,
@@ -857,8 +860,8 @@ impl FlowInfo {
     fn initialized(&self) -> InitializedInFlow {
         self.value()
             .map_or(InitializedInFlow::Yes, |v| match &v.style {
-                FlowStyle::MaybeInitialized(termination_keys) => {
-                    InitializedInFlow::DeferredCheck(termination_keys.clone())
+                FlowStyle::MaybeInitialized(nodes) => {
+                    InitializedInFlow::DeferredCheck(nodes.clone())
                 }
                 FlowStyle::Uninitialized
                 | FlowStyle::ClassField {
@@ -919,10 +922,11 @@ pub enum FlowStyle {
     /// The name is possibly uninitialized (perhaps due to merging branches)
     PossiblyUninitialized,
     /// The name may or may not be initialized depending on whether certain branches
-    /// terminate (have `Never` type). The termination keys are checked at solve time;
-    /// if all of them have `Never` type, the name is considered initialized.
-    /// This is used when some branches don't define a variable but end with a NoReturn call.
-    MaybeInitialized(Vec<Idx<Key>>),
+    /// terminate (have `Never` type). The nodes are the latest merges on the paths on which the
+    /// name is unset, in increasing order. Their keys are checked at solve time, and if no path
+    /// reaches here, the name is considered initialized. This is used when some branches don't
+    /// define a variable but end with a NoReturn call.
+    MaybeInitialized(Vec<UnsetNodeId>),
     /// The name was in an annotated declaration like `x: int` but not initialized
     Uninitialized,
     /// I'm a speculative binding for a name that was narrowed but not assigned above
@@ -965,11 +969,11 @@ impl FlowStyle {
                         _ => return FlowStyle::PossiblyUninitialized,
                     }
                 }
-                // Two MaybeInitialized: combine termination keys from both branches.
-                // Each branch independently needs its keys to be Never for that path
-                // to be initialized, so we collect all keys.
-                (FlowStyle::MaybeInitialized(keys), FlowStyle::MaybeInitialized(other_keys)) => {
-                    keys.extend(other_keys);
+                // Two MaybeInitialized: the name is unset on the paths of either branch.
+                (FlowStyle::MaybeInitialized(nodes), FlowStyle::MaybeInitialized(other_nodes)) => {
+                    nodes.extend(other_nodes);
+                    nodes.sort_unstable();
+                    nodes.dedup();
                 }
                 // Class-bearing styles stay sticky only when their canonical
                 // class identity matches. The `pristine` bit AND-merges: if
@@ -990,12 +994,12 @@ impl FlowStyle {
                     *l_pristine = *l_pristine && r_pristine;
                 }
                 // MaybeInitialized + a fully initialized style: keep the MaybeInitialized
-                // keys since those paths still need verification at solve time.
-                (FlowStyle::MaybeInitialized(keys), _) => {
-                    merged = FlowStyle::MaybeInitialized(keys.clone());
+                // nodes since they still need verification at solve time.
+                (FlowStyle::MaybeInitialized(nodes), _) => {
+                    merged = FlowStyle::MaybeInitialized(nodes.clone());
                 }
-                (_, FlowStyle::MaybeInitialized(keys)) => {
-                    merged = FlowStyle::MaybeInitialized(keys);
+                (_, FlowStyle::MaybeInitialized(nodes)) => {
+                    merged = FlowStyle::MaybeInitialized(nodes);
                 }
                 // Unclear how to merge, default to None
                 _ => {
@@ -1095,22 +1099,31 @@ struct ScopeClass {
     indices: ClassIndices,
     attributes_from_recognized_methods: SmallMap<Name, SmallMap<Name, InstanceAttribute>>,
     attributes_from_other_methods: SmallMap<Name, SmallMap<Name, InstanceAttribute>>,
+    classmethod_receivers: Option<Box<ClassmethodReceiverState>>,
     /// Attributes that `__new__` assigns on the instance it creates.
     attributes_set_on_new_instance: SmallSet<Name>,
     nn_module_registrations: NNModuleRegistrations,
     has_protocol_base: bool,
+    docstring_range: Option<TextRange>,
 }
 
 impl ScopeClass {
-    pub fn new(name: Identifier, indices: ClassIndices, has_protocol_base: bool) -> Self {
+    pub fn new(
+        name: Identifier,
+        indices: ClassIndices,
+        has_protocol_base: bool,
+        docstring_range: Option<TextRange>,
+    ) -> Self {
         Self {
             name,
             indices,
             attributes_from_recognized_methods: SmallMap::new(),
             attributes_from_other_methods: SmallMap::new(),
+            classmethod_receivers: None,
             attributes_set_on_new_instance: SmallSet::new(),
             nn_module_registrations: SmallMap::new(),
             has_protocol_base,
+            docstring_range,
         }
     }
 
@@ -1341,14 +1354,22 @@ struct Loop {
     exits: Vec<(LoopExit, Flow)>,
     /// For PEP 765: The depth of finally-blocks that this loop was created in
     finally_depth: usize,
+    /// Phi keys that this loop's back edge can reach: its own loop-head phis, and the phis of
+    /// nested loops whose entering value is one of them.
+    carried_phis: SmallSet<Idx<Key>>,
+    /// Names read through a key in `carried_phis`. A plain assignment to one of them inside
+    /// this loop may be read on the next iteration.
+    carried_reads: SmallSet<Name>,
 }
 
 impl Loop {
-    pub fn new(base: Flow, finally_depth: usize) -> Self {
+    pub fn new(base: Flow, finally_depth: usize, carried_phis: SmallSet<Idx<Key>>) -> Self {
         Self {
             base,
             exits: Default::default(),
             finally_depth,
+            carried_phis,
+            carried_reads: SmallSet::new(),
         }
     }
 }
@@ -1541,11 +1562,17 @@ impl Scope {
         indices: ClassIndices,
         name: Identifier,
         has_protocol_base: bool,
+        docstring_range: Option<TextRange>,
     ) -> Self {
         Self::new(
             range,
             FlowBarrier::AllowFlowChecked,
-            ScopeKind::Class(ScopeClass::new(name, indices, has_protocol_base)),
+            ScopeKind::Class(ScopeClass::new(
+                name,
+                indices,
+                has_protocol_base,
+                docstring_range,
+            )),
         )
     }
 
@@ -1595,6 +1622,13 @@ impl Scope {
     fn class_key(&self) -> Option<Idx<KeyClass>> {
         match &self.kind {
             ScopeKind::Class(class_scope) => Some(class_scope.indices.class_idx),
+            _ => None,
+        }
+    }
+
+    fn class_docstring_range(&self) -> Option<TextRange> {
+        match &self.kind {
+            ScopeKind::Class(class_scope) => class_scope.docstring_range,
             _ => None,
         }
     }
@@ -1661,6 +1695,13 @@ impl ScopeTreeNode {
     }
 }
 
+/// The receiver, source identifier and receiver policy of a method attribute assignment.
+pub(crate) struct SelfAttrAssignTarget<'a> {
+    pub receiver: &'a Expr,
+    pub name: &'a Identifier,
+    pub instance_only: bool,
+}
+
 /// Scopes keep track of the current stack of the scopes we are in.
 #[derive(Clone, Debug)]
 pub struct Scopes {
@@ -1671,6 +1712,7 @@ pub struct Scopes {
     keep_scope_tree: bool,
     /// True when the module is a stub (`.pyi`).
     is_interface: bool,
+    unset_nodes: UnsetNodes,
 }
 
 impl Scopes {
@@ -1683,6 +1725,7 @@ impl Scopes {
             }),
             keep_scope_tree,
             is_interface,
+            unset_nodes: UnsetNodes::default(),
         }
     }
 
@@ -1792,12 +1835,72 @@ impl Scopes {
         }
     }
 
+    /// Receiver inference must not mutate a definition shared with another control-flow path.
+    pub fn in_unconditional_class_body(&self) -> bool {
+        self.in_class_body()
+            && self.current().forks.is_empty()
+            && self.current().loops.is_empty()
+            && self.current().with_may_raise.is_empty()
+            && self.current().finally_depth == 0
+    }
+
+    /// Annotation-like scopes preserve eager class receiver bookkeeping. Function
+    /// and comprehension bodies are barriers, just as they are for class-name lookup.
+    pub(super) fn classmethod_receivers(&self) -> Option<&ClassmethodReceiverState> {
+        for scope in self.iter_rev() {
+            match &scope.kind {
+                ScopeKind::Class(class) => return class.classmethod_receivers.as_deref(),
+                ScopeKind::Annotation { .. } | ScopeKind::TypeAlias => {}
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    pub(super) fn classmethod_receivers_mut(
+        &mut self,
+    ) -> Option<&mut Option<Box<ClassmethodReceiverState>>> {
+        for scope in self.iter_rev_mut() {
+            match &mut scope.kind {
+                ScopeKind::Class(class) => return Some(&mut class.classmethod_receivers),
+                ScopeKind::Annotation { .. } | ScopeKind::TypeAlias => {}
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    pub fn mark_method_as_classmethod(&mut self, method_name: &Name, method_range: TextRange) {
+        let ScopeKind::Class(class_scope) = &mut self.current_mut().kind else {
+            unreachable!("a reassigned classmethod is only marked in a class body")
+        };
+        for attributes in [
+            &mut class_scope.attributes_from_recognized_methods,
+            &mut class_scope.attributes_from_other_methods,
+        ] {
+            if let Some(attributes) = attributes.get_mut(method_name) {
+                for attribute in attributes.values_mut() {
+                    if method_range.contains_range(attribute.2) {
+                        attribute.3 = MethodSelfKind::Class;
+                    }
+                }
+            }
+        }
+    }
+
     /// The `ClassDefIndex` of the current class body, if the innermost scope is one.
     pub fn current_class_def_index(&self) -> Option<ClassDefIndex> {
         match &self.current().kind {
             ScopeKind::Class(c) => Some(c.indices.def_index),
             _ => None,
         }
+    }
+
+    /// The `ClassDefIndex` that owns a bare name written in the current class body.
+    /// Global and nonlocal captures belong to another scope, not to this class.
+    pub fn current_class_field_owner(&self, name: &Name) -> Option<ClassDefIndex> {
+        let class_index = self.current_class_def_index()?;
+        (!self.is_mutable_capture(name)).then_some(class_index)
     }
 
     pub fn in_function_scope(&self) -> bool {
@@ -1931,6 +2034,16 @@ impl Scopes {
         self.current().class_key()
     }
 
+    /// Return enclosing classes from innermost to outermost.
+    pub fn enclosing_class_keys(&self) -> Vec<Idx<KeyClass>> {
+        self.iter_rev().filter_map(Scope::class_key).collect()
+    }
+
+    /// The range of the docstring of the class whose body we are directly in, if it has one.
+    pub fn current_class_docstring_range(&self) -> Option<TextRange> {
+        self.current().class_docstring_range()
+    }
+
     /// Are we anywhere inside a class? If so, return the class object idx.
     /// This function looks at enclosing scopes.
     pub fn enclosing_class_object_idx(&self) -> Option<Idx<Key>> {
@@ -2051,10 +2164,10 @@ impl Scopes {
     }
 
     /// There is only one scope remaining, return it.
-    pub fn finish(self) -> ScopeTrace {
+    pub fn finish(self) -> (ScopeTrace, UnsetNodes) {
         let (a, b) = self.scopes.split_off_last();
         assert_eq!(a.len(), 0);
-        ScopeTrace(b)
+        (ScopeTrace(b), self.unset_nodes)
     }
 
     pub fn has_import_name(&self, name: &Name) -> bool {
@@ -2268,50 +2381,136 @@ impl Scopes {
         self.scopes.iter_mut().map(|node| &mut node.scope).rev()
     }
 
-    /// In methods, we track assignments to `self` attribute targets so that we can
-    /// be aware of class fields implicitly defined in methods.
+    /// Finds the method scope in `self.scopes` that owns `receiver` as its receiver parameter.
+    /// Returns `Some((method_index, crossed_method))` where:
+    /// - `method_index` is the index in `self.scopes` of the `ScopeKind::Method`.
+    /// - `crossed_method` is true if the receiver was reached across a nested method boundary
+    ///   (plain closures do not count).
     ///
-    /// We currently apply this logic in all methods, although downstream code will
-    /// often complain if an attribute is implicitly defined outside of methods
-    /// (like constructors) that we recognize as always being called.
+    /// Returns `None` if `receiver` is not attributed to any method's receiver (including when
+    /// shadowed by a local variable or non-receiver parameter in an inner scope).
+    fn find_receiver_method_index(&self, receiver: &Name) -> Option<(usize, bool)> {
+        let mut crossed_method = false;
+        for (i, node) in self.scopes.iter().enumerate().rev() {
+            let scope = &node.scope;
+            // Only function-like scopes provide receiver bindings. A `nonlocal` capture
+            // refers to the enclosing binding instead of shadowing it.
+            let binds_receiver = matches!(
+                &scope.kind,
+                ScopeKind::Method(_) | ScopeKind::Function(_) | ScopeKind::Comprehension { .. }
+            ) && scope.stat.0.get(receiver).is_some_and(|info| {
+                !matches!(
+                    info.style,
+                    StaticStyle::MutableCapture(MutableCapture {
+                        kind: MutableCaptureKind::Nonlocal,
+                        ..
+                    })
+                )
+            });
+            match &scope.kind {
+                ScopeKind::Class(_) | ScopeKind::Annotation { .. } | ScopeKind::TypeAlias => {
+                    // Intervening class namespaces and annotation/typealias scopes do not shadow
+                    // lexical receiver variables in enclosed methods.
+                }
+                ScopeKind::Method(method_scope) if binds_receiver => {
+                    // The receiver is a parameter, and every parameter is in the method's static
+                    // scope, so a method's own receiver only matches here. Any other binding (e.g.
+                    // a staticmethod parameter named `self`, or a secondary parameter) shadows
+                    // outer receivers.
+                    return method_scope
+                        .self_name
+                        .as_ref()
+                        .is_some_and(|name| &name.id == receiver)
+                        .then_some((i, crossed_method));
+                }
+                ScopeKind::Function(_) | ScopeKind::Comprehension { .. } if binds_receiver => {
+                    return None;
+                }
+                ScopeKind::Function(_) | ScopeKind::Comprehension { .. } => {
+                    // A plain closure is not a method boundary: it keeps the enclosing
+                    // method's permissions (e.g. assigning `Final` fields from a helper
+                    // defined inside `__init__`, which mypy also allows).
+                }
+                ScopeKind::Method(_) => {
+                    crossed_method = true;
+                }
+                ScopeKind::Module => {
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    /// Record a receiver-attribute assignment inside its owning method scope.
+    /// Returns whether the target was a receiver attribute.
     ///
-    /// Returns `true` if the attribute was a self attribute.
-    /// Record a self attribute assignment (e.g., `self.x = value`) inside the current method scope.
-    /// We accumulate all assignments to the same attribute within the method so they can later be unioned.
+    /// Repeated assignments accumulate values and retain the first annotation.
+    /// Every method participates; field merging prioritizes recognized initializer
+    /// methods and downstream checks diagnose unsupported implicit definitions.
     pub fn record_self_attr_assign(
         &mut self,
         x: &ExprAttribute,
         value: ExprOrBinding,
         annotation: Option<Idx<KeyAnnotation>>,
     ) -> bool {
-        for scope in self.iter_rev_mut() {
-            if let ScopeKind::Method(method_scope) = &mut scope.kind
-                && let Some(self_name) = &method_scope.self_name
-                && matches!(&*x.value, Expr::Name(name) if name.id == self_name.id)
-            {
-                if let Some(attr) = method_scope.instance_attributes.get_mut(&x.attr.id) {
-                    // Accumulate subsequent assignments in the method.
-                    attr.0.push(value);
-                    // Keep the first type annotation encountered in the method.
-                    if attr.1.is_none() {
-                        attr.1 = annotation;
-                    }
-                } else {
-                    // First time seeing this attribute in this method: record it.
-                    method_scope.instance_attributes.insert(
-                        x.attr.id.clone(),
-                        InstanceAttribute(
-                            vec![value],
-                            annotation,
-                            x.attr.range(), // Keep the range of the first assignment as the definition location.
-                            method_scope.receiver_kind,
-                        ),
-                    );
-                }
-                return true;
-            }
+        self.record_self_attr_assign_named(
+            SelfAttrAssignTarget {
+                receiver: &x.value,
+                name: &x.attr,
+                instance_only: false,
+            },
+            value,
+            annotation,
+        )
+    }
+
+    /// Accumulate assignments to a matching method receiver, retaining the first annotation
+    /// and definition range. Instance-only targets exclude classmethod receivers.
+    /// Returns whether the assignment was recorded.
+    pub(crate) fn record_self_attr_assign_named(
+        &mut self,
+        target: SelfAttrAssignTarget<'_>,
+        value: ExprOrBinding,
+        annotation: Option<Idx<KeyAnnotation>>,
+    ) -> bool {
+        let SelfAttrAssignTarget {
+            receiver,
+            name,
+            instance_only,
+        } = target;
+        let Expr::Name(receiver_name) = receiver else {
+            return false;
+        };
+        let Some((method_idx, _)) = self.find_receiver_method_index(&receiver_name.id) else {
+            return false;
+        };
+        let ScopeKind::Method(method_scope) = &mut self.scopes[method_idx].scope.kind else {
+            unreachable!("`find_receiver_method_index` returns the index of a method scope");
+        };
+        if instance_only && method_scope.receiver_kind != MethodSelfKind::Instance {
+            return false;
         }
-        false
+        if let Some(attr) = method_scope.instance_attributes.get_mut(&name.id) {
+            // Accumulate subsequent assignments in the method.
+            attr.0.push(value);
+            // Keep the first type annotation encountered in the method.
+            if attr.1.is_none() {
+                attr.1 = annotation;
+            }
+        } else {
+            // First time seeing this attribute in this method: record it.
+            method_scope.instance_attributes.insert(
+                name.id.clone(),
+                InstanceAttribute(
+                    vec![value],
+                    annotation,
+                    name.range,
+                    method_scope.receiver_kind,
+                ),
+            );
+        }
+        true
     }
 
     /// Record a local bound to the result of a `__new__` call inside `__new__`, such as
@@ -2384,33 +2583,27 @@ impl Scopes {
     }
 
     pub fn method_that_sets_attr(&self, x: &ExprAttribute) -> Option<MethodThatSetsAttr> {
-        let mut method_name: Option<Name> = None;
-        let mut receiver_kind = MethodSelfKind::Instance;
-        for scope in self.iter_rev() {
-            match &scope.kind {
-                ScopeKind::Method(method_scope) if method_name.is_none() => {
-                    if let Some(self_name) = &method_scope.self_name
-                        && matches!(&*x.value, Expr::Name(name) if name.id == self_name.id)
-                    {
-                        method_name = Some(method_scope.name.id.clone());
-                        receiver_kind = method_scope.receiver_kind;
-                    } else {
-                        return None;
-                    }
-                }
-                ScopeKind::Class(class_scope) => {
-                    if let Some(method_name) = &method_name {
-                        return Some(MethodThatSetsAttr {
-                            method_name: method_name.clone(),
-                            recognized_attribute_defining_method: is_attribute_defining_method(
-                                method_name,
-                                &class_scope.name.id,
-                            ),
-                            instance_or_class: receiver_kind,
-                        });
-                    }
-                }
-                _ => {}
+        let Expr::Name(receiver) = &*x.value else {
+            return None;
+        };
+        let (method_idx, crossed_method) = self.find_receiver_method_index(&receiver.id)?;
+        if crossed_method {
+            // Permissions to write Final fields must not cross a nested-method boundary.
+            return None;
+        }
+        let ScopeKind::Method(method_scope) = &self.scopes[method_idx].scope.kind else {
+            unreachable!("`find_receiver_method_index` returns the index of a method scope");
+        };
+        for node in self.scopes[..method_idx].iter().rev() {
+            if let ScopeKind::Class(class_scope) = &node.scope.kind {
+                return Some(MethodThatSetsAttr {
+                    method_name: method_scope.name.id.clone(),
+                    recognized_attribute_defining_method: is_attribute_defining_method(
+                        &method_scope.name.id,
+                        &class_scope.name.id,
+                    ),
+                    instance_or_class: method_scope.receiver_kind,
+                });
             }
         }
         None
@@ -3039,7 +3232,12 @@ impl Scopes {
                 .variables
                 .get(&name.id)
                 .is_some_and(|usage| usage.used)
-                || self.is_parameter_used(&name.id);
+                || self.is_parameter_used(&name.id)
+                || self
+                    .current()
+                    .loops
+                    .iter()
+                    .any(|active| active.carried_reads.contains(&name.id));
             self.current_mut().variables.insert(
                 name.id.clone(),
                 VariableUsage {
@@ -3050,11 +3248,19 @@ impl Scopes {
         }
     }
 
-    pub fn mark_variable_used(&mut self, name: &Name) {
+    /// `value_idx` is the value the read resolved to in the current flow, if any.
+    pub fn mark_variable_used(&mut self, name: &Name, value_idx: Option<Idx<Key>>) {
         for scope in self.iter_rev_mut() {
             if let Some(info) = scope.variables.get_mut(name) {
                 info.used = true;
                 break;
+            }
+            if let Some(idx) = value_idx {
+                for active in scope.loops.iter_mut() {
+                    if active.carried_phis.contains(&idx) {
+                        active.carried_reads.insert(name.clone());
+                    }
+                }
             }
         }
     }
@@ -3301,13 +3507,14 @@ impl Scopes {
     /// - Panics if the current scope is not a class body.
     ///
     /// The final map contains possibly uninitialized class-body fields. Its optional
-    /// keys can prove that every path without an assignment terminates.
+    /// `UnsetNode`s can prove that every path without an assignment terminates.
     pub fn finish_class_and_get_field_definitions(
         &mut self,
     ) -> (
         SmallMap<Name, (ClassFieldDefinition, TextRange)>,
         NNModuleRegistrations,
-        SmallMap<Name, Option<Vec<Idx<Key>>>>,
+        SmallMap<Name, Option<Vec<UnsetNodeId>>>,
+        Vec<(Name, Idx<KeyAnnotation>, Idx<KeyAnnotation>)>,
     ) {
         let mut field_definitions = SmallMap::new();
         let mut uninitialized_fields = SmallMap::new();
@@ -3425,8 +3632,8 @@ impl Scopes {
                         FlowStyle::PossiblyUninitialized => {
                             uninitialized_fields.insert_hashed(name.owned(), None);
                         }
-                        FlowStyle::MaybeInitialized(keys) => {
-                            uninitialized_fields.insert_hashed(name.owned(), Some(keys.clone()));
+                        FlowStyle::MaybeInitialized(nodes) => {
+                            uninitialized_fields.insert_hashed(name.owned(), Some(nodes.clone()));
                         }
                         _ => {}
                     }
@@ -3436,6 +3643,7 @@ impl Scopes {
         // Merge assignments from different methods.
         // `method_attrs` yields attributes from recognized constructor methods first (e.g. __init__),
         // followed by other helper methods.
+        let mut redefinitions = Vec::new();
         method_attrs.into_iter().for_each(
             |(name, method, InstanceAttribute(values, annotation, range, receiver_kind))| {
                 if let Some((
@@ -3451,6 +3659,9 @@ impl Scopes {
                 {
                     if matches!(receiver_kind, MethodSelfKind::Instance) {
                         *existing_instance_write = true;
+                    }
+                    if let (Some(new_ann), Some(existing_ann)) = (annotation, *existing_annot) {
+                        redefinitions.push((name.key().clone(), new_ann, existing_ann));
                     }
                     if existing_method.recognized_attribute_defining_method
                         && !method.recognized_attribute_defining_method
@@ -3494,6 +3705,7 @@ impl Scopes {
             field_definitions,
             nn_module_registrations,
             uninitialized_fields,
+            redefinitions,
         )
     }
 
@@ -4047,8 +4259,8 @@ enum DefinitionStatus {
     /// Variable is defined in all non-terminating branches.
     Defined,
     /// Variable may be defined if branches with these keys terminate (have `Never` type).
-    /// The keys are checked at solve time; if all have `Never` type, the variable is
-    /// considered initialized.
+    /// The keys start a path on which the variable is unset, which is decided at solve time
+    /// together with the later merges the path passes through.
     DeferredCheck(Vec<Idx<Key>>),
     /// Variable is not defined in some branches that may not terminate.
     NotDefined,
@@ -4311,7 +4523,11 @@ impl<'a> BindingsBuilder<'a> {
         let mut branch_idxs = SmallSet::with_capacity(merge_branches.len());
         let mut branch_infos = Vec::with_capacity(merge_branches.len());
         let mut styles = Vec::with_capacity(merge_branches.len());
-        let mut styled_idxs = SmallSet::with_capacity(merge_branches.len());
+        // For each value, the position of its style, and the termination keys of the branches
+        // that carry it, or `None` once one of them has no key.
+        let mut styled_values: SmallMap<Idx<Key>, (usize, Option<Vec<Idx<Key>>>)> =
+            SmallMap::with_capacity(merge_branches.len());
+        let n_merge_branches = merge_branches.len();
         let mut n_values = 0;
         let mut n_possibly_set_branches = 0;
         // Collect termination keys from branches that don't define the variable.
@@ -4377,11 +4593,41 @@ impl<'a> BindingsBuilder<'a> {
                 value_idxs.insert(v.idx);
                 // An invariant in Pyrefly is that we only set style when we
                 // set a value, so duplicate value_idxs always have the same style.
-                if !unset_unless_terminated && styled_idxs.insert(v.idx) {
-                    styles.push(v.style);
+                if !unset_unless_terminated {
+                    if let Some((_, keys)) = styled_values.get_mut(&v.idx) {
+                        *keys =
+                            keys.take()
+                                .zip(merge_branch.termination_key)
+                                .map(|(mut keys, key)| {
+                                    keys.push(key);
+                                    keys
+                                });
+                    } else {
+                        styled_values.insert(
+                            v.idx,
+                            (
+                                styles.len(),
+                                merge_branch.termination_key.map(|key| vec![key]),
+                            ),
+                        );
+                        styles.push(v.style);
+                    }
                 }
             }
             branch_idxs.insert(branch_idx);
+        }
+
+        // A path on which the name is unset reaches this merge only through the branches that
+        // carry its value, so it continues only if one of their termination keys is not `Never`.
+        // Those branches share one node for the merge. When every branch carries the value,
+        // reaching the merge is enough, so the paths need no new node.
+        for (position, keys) in styled_values.into_values() {
+            if let FlowStyle::MaybeInitialized(nodes) = &mut styles[position]
+                && let Some(keys) = keys
+                && keys.len() < n_merge_branches
+            {
+                *nodes = vec![self.scopes.unset_nodes.push_merge(keys, mem::take(nodes))];
+            }
         }
 
         let definition_status = determine_definition_status(
@@ -4393,18 +4639,25 @@ impl<'a> BindingsBuilder<'a> {
             n_unterminated_missing_branches,
             missing_branch_termination_keys,
         );
+        // The branches that leave the name unset start a path at this merge.
+        let unset_here = match &definition_status {
+            DefinitionStatus::DeferredCheck(keys) => {
+                Some(self.scopes.unset_nodes.push_start(keys.clone()))
+            }
+            DefinitionStatus::Defined | DefinitionStatus::NotDefined => None,
+        };
 
         // Helper to compute the final FlowStyle based on definition status.
         let compute_final_style = |styles: Vec<FlowStyle>| -> FlowStyle {
             match &definition_status {
                 // Every branch that leaves the name unset has a key, so the keys decide those
                 // branches. A branch that may hold the name without a key keeps its doubt.
-                DefinitionStatus::DeferredCheck(keys) => FlowStyle::merged(
+                DefinitionStatus::DeferredCheck(_) => FlowStyle::merged(
                     true,
                     styles
                         .into_iter()
                         .filter(|style| !matches!(style, FlowStyle::Uninitialized))
-                        .chain([FlowStyle::MaybeInitialized(keys.clone())]),
+                        .chain(unset_here.map(|node| FlowStyle::MaybeInitialized(vec![node]))),
                     merge_style,
                 ),
                 DefinitionStatus::Defined => {
@@ -4543,6 +4796,40 @@ impl<'a> BindingsBuilder<'a> {
             None
         };
 
+        // A branch that did not terminate syntactically may still end in a statement whose
+        // type is only known to be `Never` at solve time, such as a `NoReturn` call or the
+        // fall-through of a type-exhaustive `match`. If every live branch ends that way, the
+        // merged flow is itself only conditionally live, so it carries a termination key of
+        // its own for an enclosing merge to check. A loop always keeps the pre-loop path
+        // live, so its merge never terminates this way.
+        let last_stmt_expr = if has_terminated || merge_style.is_loop() {
+            None
+        } else {
+            all_termination_keys
+                .iter()
+                .copied()
+                .collect::<Option<SmallSet<Idx<Key>>>>()
+                .map(|keys| {
+                    if keys.len() == 1 {
+                        *keys.first().unwrap()
+                    } else {
+                        // Each key is also its own termination key, so the join drops every
+                        // branch that solves to `Never` and is `Never` only if all of them are.
+                        let branches = keys
+                            .into_iter()
+                            .map(|key| BranchInfo {
+                                value_key: key,
+                                termination_key: Some(key),
+                            })
+                            .collect();
+                        self.insert_binding(
+                            Key::FlowTermination(range),
+                            Binding::Phi(JoinStyle::SimpleMerge, branches),
+                        )
+                    }
+                })
+        };
+
         // Collect all unique names from base + all flows. We need this before we construct merge items
         // so that we can accurately represent a flow in which some name doesn't appear.
         let mut all_names: SmallSet<Name> = SmallSet::new();
@@ -4602,7 +4889,7 @@ impl<'a> BindingsBuilder<'a> {
             has_terminated,
             terminated_by_raise: has_terminated && any_terminated_by_raise,
             is_definitely_unreachable: all_are_unreachable,
-            last_stmt_expr: None,
+            last_stmt_expr,
             last_func_def,
         };
         self.scopes.current_mut().flow = flow
@@ -4614,15 +4901,48 @@ impl<'a> BindingsBuilder<'a> {
         mut flow: Flow,
         range: TextRange,
         exclude_names: &SmallSet<Name>,
-    ) -> Flow {
+    ) -> (Flow, SmallSet<Idx<Key>>) {
         // Sequential facts do not establish invariants across loop backedges.
         flow.excluded_none_pairs = ExcludedNonePairs::default();
+        let mut phis = SmallSet::new();
         for (name, info) in flow.info.iter_mut() {
             if exclude_names.contains(name) {
                 continue;
             }
+            // Import identities with no local writes across the loop need no speculative value
+            // join. Keep their available bindings; narrowing joins still happen at teardown.
+            let stable_import = info.value.as_ref().is_some_and(|value| {
+                matches!(
+                    value.style,
+                    FlowStyle::Import(..) | FlowStyle::ImportAs(_) | FlowStyle::MergeableImport(_)
+                ) && self.scopes.current().stat.0.get(name).is_none_or(|decl| {
+                    let eligible = match decl.style {
+                        StaticStyle::SingleDef(_) | StaticStyle::ImplicitBuiltinImport(_) => true,
+                        // Wildcard symbols also have this static style, but their declaration
+                        // ranges can collapse multiple imports. Only real module values qualify.
+                        StaticStyle::MergeableImport => {
+                            matches!(value.style, FlowStyle::MergeableImport(_))
+                        }
+                        _ => false,
+                    };
+                    eligible && decl.last_range.end() <= range.start()
+                })
+            });
+            if stable_import {
+                continue;
+            }
             // We are promising to insert a binding for this key when we merge the flow
             let phi_idx = self.idx_for_promise(Key::Phi(Box::new((name.clone(), range))));
+            // An enclosing loop's back edge also reaches this phi when it reaches the value
+            // entering this loop.
+            if let Some(value) = &info.value {
+                for enclosing in self.scopes.current_mut().loops.iter_mut() {
+                    if enclosing.carried_phis.contains(&value.idx) {
+                        enclosing.carried_phis.insert(phi_idx);
+                    }
+                }
+            }
+            phis.insert(phi_idx);
             match &mut info.value {
                 Some(value) => {
                     value.idx = phi_idx;
@@ -4638,7 +4958,7 @@ impl<'a> BindingsBuilder<'a> {
                 }
             }
         }
-        flow
+        (flow, phis)
     }
 
     /// Set up a loop: preserve the base flow and push the loop to the current
@@ -4652,12 +4972,12 @@ impl<'a> BindingsBuilder<'a> {
         let base = mem::take(&mut self.scopes.current_mut().flow);
         // To account for possible assignments to existing names in a loop, we
         // speculatively insert phi keys upfront.
-        self.scopes.current_mut().flow =
-            self.insert_phi_keys(base.clone(), range, loop_header_targets);
+        let (flow, phis) = self.insert_phi_keys(base.clone(), range, loop_header_targets);
+        self.scopes.current_mut().flow = flow;
         self.scopes
             .current_mut()
             .loops
-            .push(Loop::new(base, finally_depth));
+            .push(Loop::new(base, finally_depth, phis));
     }
 
     pub fn teardown_loop(

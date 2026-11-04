@@ -49,6 +49,7 @@ use crate::alt::callable::ReturnTypeResolutionError;
 use crate::alt::class::class_field::ClassAttribute;
 use crate::alt::class::class_field::DescriptorBase;
 use crate::alt::class::dataclass::ReplaceKind;
+use crate::alt::expr::ExprCallee;
 use crate::alt::expr::TypeOrExpr;
 use crate::alt::nn_module_specials::is_nn_sequential;
 use crate::alt::unwrap::HintRef;
@@ -268,7 +269,7 @@ impl CallTargetLookup {
     }
 }
 
-/// Result of `construct_{class,typed_dict}_inner`
+/// A constructor outcome whose diagnostics remain local until `take`.
 struct ConstructedInstance {
     ty: Type,
     /// Does the type match the provided hint? False if no hint was provided
@@ -945,8 +946,22 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         errors: &ErrorCollector,
         context: Option<&dyn Fn() -> ErrorContext>,
     ) {
-        if let Some(metadata) = target.function_metadata()
-            && let Some(deprecation) = &metadata.flags.deprecation
+        let Some(metadata) = target.function_metadata() else {
+            return;
+        };
+        // A callback's deprecated `__call__` applies to calls, not references to the callback.
+        let callback = if metadata.flags.deprecation.is_none()
+            && let FunctionKind::CallbackProtocol(cls) = &metadata.kind
+        {
+            self.instance_as_dunder_call(cls)
+        } else {
+            None
+        };
+        if let Some(deprecation) = metadata
+            .flags
+            .deprecation
+            .as_deref()
+            .or_else(|| callback.as_ref().and_then(Type::function_deprecation))
         {
             let header = format!(
                 "`{}` is deprecated",
@@ -975,11 +990,21 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         errors: &ErrorCollector,
         context: Option<&dyn Fn() -> ErrorContext>,
     ) -> CallTarget {
+        let target = self.resolve_call_target_or_error(ty, call_style, range, errors, context);
+        self.report_call_deprecation(&target, range, errors, context);
+        target
+    }
+
+    fn resolve_call_target_or_error(
+        &self,
+        ty: Type,
+        call_style: CallStyle,
+        range: TextRange,
+        errors: &ErrorCollector,
+        context: Option<&dyn Fn() -> ErrorContext>,
+    ) -> CallTarget {
         match self.as_call_target(ty) {
-            CallTargetLookup::Ok(target) => {
-                self.report_call_deprecation(&target, range, errors, context);
-                *target
-            }
+            CallTargetLookup::Ok(target) => *target,
             CallTargetLookup::Error(ty, ..) => {
                 // Re-query `__call__` only on the error path so ordinary calls don't pay for
                 // preserving the original access error through call target resolution.
@@ -1200,21 +1225,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
     }
 
-    /// Handles union hint decomposition for class and TypedDict construction.
-    /// When the hint is a union, tries each member independently and keeps only
-    /// successful constructions, preferring those assignable to their hint member.
-    /// Falls back to constructing with no hint if all members produce errors or
-    /// the union is too wide.
+    /// Selects a constructor outcome without publishing its diagnostics.
+    /// Prefers the first hint match without hard call errors or specialization failures.
+    /// Otherwise keeps the first outcome without hard call errors, or constructs without a hint.
+    /// Hints wider than `MAX_HINT_WIDTH` are ignored.
     fn construct_with_hint(
         &self,
-        arguments_range: TextRange,
-        errors: &ErrorCollector,
-        arg_errors: &ErrorCollector,
-        return_errors: &ErrorCollector,
-        context: Option<&dyn Fn() -> ErrorContext>,
         hint: Option<HintRef>,
         construct: impl Fn(Option<&Type>) -> ConstructedInstance,
-    ) -> Type {
+    ) -> ConstructedInstance {
         if let Some(hint) = hint
             && let hints = hint.types()
             && hints.len() <= MAX_HINT_WIDTH
@@ -1229,14 +1248,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     // Take the first successful match. We require the result to be assignable to the
                     // hint so that, in a case like `x: list[X] | None = [XChild()]`, we choose the
                     // `list[X]` branch with contextually typed results.
-                    return ret.take(
-                        arguments_range,
-                        errors,
-                        arg_errors,
-                        return_errors,
-                        context,
-                        self,
-                    );
+                    return ret;
                 }
                 if ret_no_match_hint.is_none() {
                     ret_no_match_hint = Some(ret);
@@ -1245,26 +1257,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             if let Some(ret) = ret_no_match_hint {
                 // Even if none of the results were assignable to their hints, we still keep the
                 // first contextually typed result if it only produced specialization errors.
-                return ret.take(
-                    arguments_range,
-                    errors,
-                    arg_errors,
-                    return_errors,
-                    context,
-                    self,
-                );
+                return ret;
             }
         }
         // If the hint is too wide or always produces non-specialization errors, don't use it.
-        let ret = construct(None);
-        ret.take(
-            arguments_range,
-            errors,
-            arg_errors,
-            return_errors,
-            context,
-            self,
-        )
+        construct(None)
     }
 
     fn construct_class(
@@ -1324,25 +1321,25 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             None => (args, keywords),
         };
 
-        self.construct_with_hint(
+        self.construct_with_hint(HintRef::filter_for_constructor(hint, cls.targs()), |hint| {
+            self.construct_class_inner(
+                cls.clone(),
+                constructor_kind.clone(),
+                args,
+                keywords,
+                arguments_range,
+                callee_range,
+                context,
+                hint,
+            )
+        })
+        .take(
             arguments_range,
             errors,
             arg_errors,
             return_errors,
             context,
-            HintRef::filter_for_constructor(hint, cls.targs()),
-            |hint| {
-                self.construct_class_inner(
-                    cls.clone(),
-                    constructor_kind.clone(),
-                    args,
-                    keywords,
-                    arguments_range,
-                    callee_range,
-                    context,
-                    hint,
-                )
-            },
+            self,
         )
     }
 
@@ -1582,7 +1579,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if class_metadata.is_pydantic_model()
             && let Some(dataclass) = class_metadata.dataclass_metadata()
         {
-            self.check_pydantic_argument_range_constraints(
+            self.check_pydantic_argument_constraints(
                 cls.class_object(),
                 dataclass,
                 args,
@@ -1723,11 +1720,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         hint: Option<HintRef>,
     ) -> Type {
         self.construct_with_hint(
-            arguments_range,
-            errors,
-            arg_errors,
-            return_errors,
-            context,
             HintRef::filter_for_constructor(hint, typed_dict.targs()),
             |hint| {
                 self.construct_typed_dict_inner(
@@ -1739,6 +1731,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     hint,
                 )
             },
+        )
+        .take(
+            arguments_range,
+            errors,
+            arg_errors,
+            return_errors,
+            context,
+            self,
         )
     }
 
@@ -1965,6 +1965,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 None
             }
         };
+        let wrapped_arg = self.functools_wrapped_arg(metadata, args, keywords, errors);
         let outcome = match call_target {
             CallTarget::Class(cls, constructor_kind, as_quantified_bound) => {
                 if cls.has_qname("typing", "Any") {
@@ -2226,7 +2227,18 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             ty: res,
             overload_table,
         } = outcome;
-        let res = if let Some(func_metadata) = kw_metadata {
+        let res = if let Some((func_metadata, wrapped)) = wrapped_arg.as_ref()
+            && func_metadata.kind == FunctionKind::FunctoolsWraps
+        {
+            let mut kws = TypeMap::new();
+            kws.0
+                .insert(Name::new_static("__wrapped__"), wrapped.clone());
+            self.heap.mk_kw_call(KwCall {
+                func_metadata: func_metadata.clone(),
+                keywords: kws,
+                return_ty: res,
+            })
+        } else if let Some(func_metadata) = kw_metadata {
             // The call form `dataclass(C)` transforms `C` in place, so reject the same
             // class kinds as the `@dataclass` decorator (see `report_forbidden_dataclass_target`).
             // The decorator path never reaches here: a bare decorator is not a call.
@@ -2263,6 +2275,18 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 keywords: kws,
                 return_ty: res,
             })
+        } else {
+            res
+        };
+        // Keep ordinary functions as functions so descriptor binding and function flags survive.
+        let res = if let Some((metadata, wrapped)) = wrapped_arg
+            && metadata.kind == FunctionKind::FunctoolsUpdateWrapper
+            && let Some(mut wrapper) = self
+                .positional_arg_type(args, 0, errors)
+                .or_else(|| self.keyword_arg_type(keywords, "wrapper", errors))
+            && wrapper.set_wrapped(wrapped)
+        {
+            wrapper
         } else {
             res
         };
@@ -2365,9 +2389,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let first_use_types = self.active_first_use_types();
         roots.extend(first_use_types.iter());
         let lambda_snapshot = self.snapshot_lambda_param_types();
+        roots.extend(lambda_snapshot.iter().filter_map(|(_, ty)| ty.as_ref()));
         let mut accepted = Vec::new();
         let mut failures = Vec::new();
         for (index, member) in targets.iter().enumerate() {
+            let _lambda_context = self.enter_lambda_binding_context([]);
             let snapshot = self.solver().snapshot_reachable_vars(&roots);
             let arg_errors = self.error_collector();
             let attempt_errors = self.error_collector();
@@ -2522,6 +2548,49 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             self.set_lambda_param_type(id, self.unions(types));
         }
         CallOutcome::of_ty(self.intersect_guarantees(&results))
+    }
+
+    fn functools_wrapped_arg(
+        &self,
+        metadata: Option<&FuncMetadata>,
+        args: &[CallArg],
+        keywords: &[CallKeyword],
+        errors: &ErrorCollector,
+    ) -> Option<(FuncMetadata, Type)> {
+        let metadata = metadata?;
+        let wrapped = match metadata.kind {
+            FunctionKind::FunctoolsWraps => self
+                .positional_arg_type(args, 0, errors)
+                .or_else(|| self.keyword_arg_type(keywords, "wrapped", errors)),
+            FunctionKind::FunctoolsUpdateWrapper => self
+                .positional_arg_type(args, 1, errors)
+                .or_else(|| self.keyword_arg_type(keywords, "wrapped", errors)),
+            _ => None,
+        }?;
+        Some((metadata.clone(), wrapped))
+    }
+
+    fn positional_arg_type(
+        &self,
+        args: &[CallArg],
+        index: usize,
+        errors: &ErrorCollector,
+    ) -> Option<Type> {
+        match args.get(index)? {
+            CallArg::Arg(value) => Some((*value).infer(self, errors)),
+            CallArg::Star(..) => None,
+        }
+    }
+
+    fn keyword_arg_type(
+        &self,
+        keywords: &[CallKeyword],
+        name: &str,
+        errors: &ErrorCollector,
+    ) -> Option<Type> {
+        keywords.iter().find_map(|kw| {
+            (kw.arg.is_some_and(|id| id.as_str() == name)).then(|| kw.value.infer(self, errors))
+        })
     }
 
     /// Wrapper for `callable_infer` that handles trying a call with and without a contextual hint.
@@ -2980,77 +3049,88 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     pub fn expr_call_infer(
         &self,
-        x: &ExprCall,
-        mut callee_ty: Type,
+        mut callee: ExprCallee,
         hint: Option<HintRef>,
         errors: &ErrorCollector,
     ) -> Type {
         // nn.Sequential chain: thread input through each module's forward method.
         // Must be checked before generic Module forward dispatch, which would erase shapes.
-        if let Type::ClassType(cls) = &callee_ty
+        if let Type::ClassType(cls) = &callee.ty
             && is_nn_sequential(cls)
-            && x.arguments.args.len() == 1
-            && x.arguments.keywords.is_empty()
+            && callee.expr.arguments.args.len() == 1
+            && callee.expr.arguments.keywords.is_empty()
         {
-            let input_ty = self.expr_infer(&x.arguments.args[0], errors);
+            let input_ty = self.expr_infer(&callee.expr.arguments.args[0], errors);
             if let Some(result) =
-                self.try_nn_sequential_chain_forward(cls, input_ty, x.range(), errors)
+                self.try_nn_sequential_chain_forward(cls, input_ty, callee.expr.range(), errors)
             {
                 return result;
             }
         }
 
-        let django_annotate_call = self.infer_django_annotate_call(&callee_ty, &x.arguments);
-        let polars_call = self.infer_polars_call_specialization(&callee_ty, &x.arguments, errors);
+        let django_annotate_call =
+            self.infer_django_annotate_call(&callee.ty, &callee.expr.arguments);
+        let polars_call =
+            self.infer_polars_call_specialization(&callee.ty, &callee.expr.arguments, errors);
 
-        let result = if matches!(&callee_ty, Type::ClassDef(cls) if cls.is_builtin("super")) {
+        let result = if matches!(&callee.ty, Type::ClassDef(cls) if cls.is_builtin("super")) {
             // Because we have to construct a binding for super in order to fill in implicit arguments,
             // we can't handle things like local aliases to super. If we hit a case where the binding
             // wasn't constructed, fall back to `Any`.
-            self.get_hashed_opt(Hashed::new(&Key::SuperInstance(x.range())))
+            self.get_hashed_opt(Hashed::new(&Key::SuperInstance(callee.expr.range())))
                 .map_or_else(
                     || self.heap.mk_any_implicit(),
                     |type_info| type_info.ty().clone(),
                 )
         } else {
-            self.expand_mut(&mut callee_ty);
-            self.check_unittest_mock_patch_target(&callee_ty, &x.arguments, errors);
+            self.expand_mut(&mut callee.ty);
+            self.check_unittest_mock_patch_target(&callee.ty, &callee.expr.arguments, errors);
 
             let call = CallWithTypes::new();
-            let (args, kws) = if callee_ty.is_union() {
+            let (args, kws) = if callee.ty.is_union() {
                 // If we have a union we will distribute over it, and end up duplicating each function call.
                 (
-                    x.arguments
+                    callee
+                        .expr
+                        .arguments
                         .args
                         .map(|x| call.call_arg(&CallArg::expr_maybe_starred(x), self, errors)),
-                    x.arguments
+                    callee
+                        .expr
+                        .arguments
                         .keywords
                         .map(|x| call.call_keyword(&CallKeyword::new(x), self, errors)),
                 )
             } else {
                 (
-                    x.arguments.args.map(CallArg::expr_maybe_starred),
-                    x.arguments.keywords.map(CallKeyword::new),
+                    callee.expr.arguments.args.map(CallArg::expr_maybe_starred),
+                    callee.expr.arguments.keywords.map(CallKeyword::new),
                 )
             };
 
-            let result = self.distribute_over_union(&callee_ty, |ty| {
+            let result = self.distribute_over_union(&callee.ty, |ty| {
                 // NotImplemented is a singleton constant, not a callable class.
                 if matches!(ty, Type::ClassType(cls) if cls.is_builtin("_NotImplementedType") || cls.has_qname("types", "NotImplementedType"))
                 {
                     return self.error(
                         errors,
-                        x.func.range(),
+                        callee.expr.func.range(),
                         ErrorKind::NotCallable,
                         "`NotImplemented` is not callable. Did you mean `NotImplementedError`?".to_owned(),
                     );
                 }
+                self.check_pydantic_model_validate_constraints(
+                    ty,
+                    &callee.expr.arguments.args,
+                    &callee.expr.arguments.keywords,
+                    errors,
+                );
                 match ty.callee_kind() {
                 Some(CalleeKind::Function(FunctionKind::AssertType)) => self
                     .call_assert_type(
-                        &x.arguments.args,
-                        &x.arguments.keywords,
-                        x.arguments.range,
+                        &callee.expr.arguments.args,
+                        &callee.expr.arguments.keywords,
+                        callee.expr.arguments.range,
                         hint,
                         errors,
                     ),
@@ -3059,17 +3139,17 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 }) => self
                     .call_assert_shape(
                         ty,
-                        &x.arguments.args,
-                        &x.arguments.keywords,
-                        x.arguments.range,
+                        &callee.expr.arguments.args,
+                        &callee.expr.arguments.keywords,
+                        callee.expr.arguments.range,
                         hint,
                         errors,
                     ),
                 Some(CalleeKind::Function(FunctionKind::RevealType)) => self
                     .call_reveal_type(
-                        &x.arguments.args,
-                        &x.arguments.keywords,
-                        x.arguments.range,
+                        &callee.expr.arguments.args,
+                        &callee.expr.arguments.keywords,
+                        callee.expr.arguments.range,
                         hint,
                         errors,
                     ),
@@ -3077,11 +3157,16 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     // For typing.cast, we have to hard-code a check for whether the first argument
                     // is a type, so it's simplest to special-case the entire call.
                     self.call_typing_cast(
-                        &x.arguments.args,
-                        &x.arguments.keywords,
-                        x.arguments.range,
+                        &callee.expr.arguments.args,
+                        &callee.expr.arguments.keywords,
+                        callee.expr.arguments.range,
                         errors,
                     )
+                }
+                Some(CalleeKind::Function(FunctionKind::InspectUnwrap))
+                    if let Some(ret) = self.call_inspect_unwrap(callee.expr, errors) =>
+                {
+                    ret
                 }
                 // `attr.evolve` validates kwargs like `dataclasses.replace`; `attr.assoc` validates
                 // against attribute names, including `init=False` fields. Both require an attrs class.
@@ -3104,8 +3189,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         ty,
                         &args,
                         &kws,
-                        x.func.range(),
-                        x.arguments.range,
+                        callee.expr.func.range(),
+                        callee.expr.arguments.range,
                         hint,
                         errors,
                     )
@@ -3115,8 +3200,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         ty,
                         &args,
                         &kws,
-                        x.func.range(),
-                        x.arguments.range,
+                        callee.expr.func.range(),
+                        callee.expr.arguments.range,
                         hint,
                         errors,
                     )
@@ -3129,8 +3214,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         ty,
                         &args,
                         &kws,
-                        x.func.range(),
-                        x.arguments.range,
+                        callee.expr.func.range(),
+                        callee.expr.arguments.range,
                         hint,
                         errors,
                     )
@@ -3141,51 +3226,61 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ) =>
                 {
                     self.call_typeform(
-                        &x.arguments.args,
-                        &x.arguments.keywords,
-                        x.arguments.range,
+                        &callee.expr.arguments.args,
+                        &callee.expr.arguments.keywords,
+                        callee.expr.arguments.range,
                         errors,
                     )
                 }
-                // Treat assert_type and reveal_type like pseudo-builtins for convenience. Note that we still
-                // log a name-not-found error, but we also assert/reveal the type as requested.
-                None if ty.is_error() && is_special_name(&x.func, "assert_type") => self
-                    .call_assert_type(
-                        &x.arguments.args,
-                        &x.arguments.keywords,
-                        x.arguments.range,
+                Some(CalleeKind::Function(FunctionKind::SqlAlchemyMappedColumn(_))) => self
+                    .call_sqlalchemy_mapped_column(
+                        ty.clone(),
+                        &args,
+                        &kws,
+                        callee.expr.func.range(),
+                        &callee.expr.arguments,
                         hint,
                         errors,
                     ),
-                None if ty.is_error() && is_special_name(&x.func, "reveal_type") => self
+                // Treat assert_type and reveal_type like pseudo-builtins for convenience. Note that we still
+                // log a name-not-found error, but we also assert/reveal the type as requested.
+                None if ty.is_error() && is_special_name(&callee.expr.func, "assert_type") => self
+                    .call_assert_type(
+                        &callee.expr.arguments.args,
+                        &callee.expr.arguments.keywords,
+                        callee.expr.arguments.range,
+                        hint,
+                        errors,
+                    ),
+                None if ty.is_error() && is_special_name(&callee.expr.func, "reveal_type") => self
                     .call_reveal_type(
-                        &x.arguments.args,
-                        &x.arguments.keywords,
-                        x.arguments.range,
+                        &callee.expr.arguments.args,
+                        &callee.expr.arguments.keywords,
+                        callee.expr.arguments.range,
                         hint,
                         errors,
                     ),
                 Some(CalleeKind::Function(FunctionKind::IsInstance))
-                    if self.has_exactly_two_posargs(&x.arguments) =>
+                    if self.has_exactly_two_posargs(&callee.expr.arguments) =>
                 {
-                    self.call_isinstance(&x.arguments.args[0], &x.arguments.args[1], errors)
+                    self.call_isinstance(&callee.expr.arguments.args[0], &callee.expr.arguments.args[1], errors)
                 }
                 Some(CalleeKind::Function(FunctionKind::IsSubclass))
-                    if self.has_exactly_two_posargs(&x.arguments) =>
+                    if self.has_exactly_two_posargs(&callee.expr.arguments) =>
                 {
-                    self.call_issubclass(&x.arguments.args[0], &x.arguments.args[1], errors)
+                    self.call_issubclass(&callee.expr.arguments.args[0], &callee.expr.arguments.args[1], errors)
                 }
                 Some(CalleeKind::Function(FunctionKind::Len))
-                    if x.arguments.args.len() == 1
-                        && x.arguments.keywords.is_empty()
-                        && !matches!(&x.arguments.args[0], Expr::Starred(_)) =>
+                    if callee.expr.arguments.args.len() == 1
+                        && callee.expr.arguments.keywords.is_empty()
+                        && !matches!(&callee.expr.arguments.args[0], Expr::Starred(_)) =>
                 {
                     self.call_len(
                         &args,
                         ty.clone(),
                         &kws,
-                        x.func.range(),
-                        x.arguments.range(),
+                        callee.expr.func.range(),
+                        callee.expr.arguments.range(),
                         hint,
                         errors,
                     )
@@ -3193,16 +3288,16 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 // `f.register(C)(impl)`: applying the tagged factory decorator by call.
                 _ if let Type::KwCall(kw) = ty
                     && matches!(&kw.func_metadata.kind, FunctionKind::SingleDispatchRegister(_))
-                    && x.arguments.args.len() == 1
-                    && x.arguments.keywords.is_empty() =>
+                    && callee.expr.arguments.args.len() == 1
+                    && callee.expr.arguments.keywords.is_empty() =>
                 {
                     self.apply_singledispatch_register(
                         ty,
-                        &x.arguments.args[0],
+                        &callee.expr.arguments.args[0],
                         &args,
                         &kws,
-                        x.func.range(),
-                        x.arguments.range(),
+                        callee.expr.func.range(),
+                        callee.expr.arguments.range(),
                         hint,
                         errors,
                     )
@@ -3211,30 +3306,30 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     .call_singledispatch_register(
                         fallback_first,
                         ty,
-                        &x.arguments,
+                        &callee.expr.arguments,
                         &args,
                         &kws,
-                        x.func.range(),
-                        x.arguments.range(),
+                        callee.expr.func.range(),
+                        callee.expr.arguments.range(),
                         hint,
                         errors,
                     ),
                 _ if matches!(ty, Type::ClassDef(cls) if cls == self.stdlib.builtins_type().class_object())
-                    && x.arguments.args.len() == 1 && x.arguments.keywords.is_empty() =>
+                    && callee.expr.arguments.args.len() == 1 && callee.expr.arguments.keywords.is_empty() =>
                 {
                     // We may be able to provide a more precise type when the constructor for `builtins.type`
                     // is called with a single argument.
-                    let arg_ty = self.expr_infer(&x.arguments.args[0], errors);
+                    let arg_ty = self.expr_infer(&callee.expr.arguments.args[0], errors);
                     self.type_of(arg_ty)
                 }
                 _ if matches!(ty, Type::ClassDef(cls) if cls == self.stdlib.builtins_type().class_object())
-                    && x.arguments.args.len() == 3 =>
+                    && callee.expr.arguments.args.len() == 3 =>
                 {
-                    self.check_dynamic_type_bases(&x.arguments.args[1], errors);
-                    self.freeform_call_infer(ty.clone(), &args, &kws, x.func.range(), x.arguments.range(), hint, errors)
+                    self.check_dynamic_type_bases(&callee.expr.arguments.args[1], errors);
+                    self.freeform_call_infer(ty.clone(), &args, &kws, callee.expr.func.range(), callee.expr.arguments.range(), hint, errors)
                         .ty
                 }
-                _ if let Some(ret) = self.call_builtin_enumerate(ty, x, errors) => ret,
+                _ if let Some(ret) = self.call_builtin_enumerate(ty, callee.expr, errors) => ret,
                 // `functools.partial(func, ...)` synthesizes the remaining callable instead of the
                 // opaque stub, so calls on the result are checked (see `alt::functools`).
                 _ if matches!(ty, Type::ClassDef(cls) if cls.has_toplevel_qname("functools", "partial")) =>
@@ -3243,8 +3338,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         ty,
                         &args,
                         &kws,
-                        x.func.range(),
-                        x.arguments.range(),
+                        callee.expr.func.range(),
+                        callee.expr.arguments.range(),
                         hint,
                         errors,
                     )
@@ -3264,18 +3359,47 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     self.widen_singledispatch_dispatch_param(ty.clone()),
                     &args,
                     &kws,
-                    x.func.range(),
-                    x.arguments.range(),
+                    callee.expr.func.range(),
+                    callee.expr.arguments.range(),
                     hint,
                     errors,
                 ).ty,
                 _ => {
                     // Match expression inference so deprecation warnings share the value's range.
-                    let mut callee = &*x.func;
-                    while let Expr::Named(named) = callee {
-                        callee = &named.value;
+                    let mut callee_func = &*callee.expr.func;
+                    while let Expr::Named(named) = callee_func {
+                        callee_func = &named.value;
                     }
-                    self.freeform_call_infer(ty.clone(), &args, &kws, callee.range(), x.arguments.range(), hint, errors).ty
+                    let target = self.resolve_call_target_or_error(
+                        ty.clone(),
+                        CallStyle::FreeForm,
+                        callee_func.range(),
+                        errors,
+                        None,
+                    );
+                    // Match check_for_deprecated_call's function reference check: each
+                    // branch reports it at its own range. Property and `__call__`
+                    // deprecations still need call-site checks, and call inference
+                    // separately reports deprecated overloads.
+                    let reference_already_checked = matches!(callee_func, Expr::If(..) | Expr::BoolOp(..))
+                        && ty.function_deprecation().is_some()
+                        && ty.property_metadata().is_none();
+                    if !reference_already_checked {
+                        self.report_call_deprecation(&target, callee_func.range(), errors, None);
+                    }
+                    self.call_infer_with_callee_range(
+                        target,
+                        &args,
+                        &kws,
+                        callee.expr.arguments.range(),
+                        Some(callee_func.range()),
+                        errors,
+                        errors,
+                        errors,
+                        None,
+                        hint,
+                        None,
+                    ).ty
                 }
             }});
             // TypeIs and TypeGuard functions return bool at runtime
@@ -3366,6 +3490,81 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 "unittest.mock.patch target",
             );
         }
+    }
+
+    fn call_inspect_unwrap(&self, x: &ExprCall, errors: &ErrorCollector) -> Option<Type> {
+        if x.arguments.args.len() != 1 || matches!(x.arguments.args[0], Expr::Starred(_)) {
+            return None;
+        }
+        if !x.arguments.keywords.iter().all(|kw| {
+            kw.arg.as_ref().is_some_and(|id| id.as_str() == "stop")
+                && matches!(kw.value, Expr::NoneLiteral(_))
+        }) {
+            return None;
+        }
+
+        let arg = &x.arguments.args[0];
+        let ty = self.expr_infer(arg, errors);
+        let has_mutation = self
+            .get_idx(self.bindings().functools_wrapper_mutation())
+            .ty()
+            .as_bool();
+        if has_mutation != Some(false) {
+            // Depth-limited solving can return a placeholder even for this constant binding.
+            // Runtime accepts arbitrary objects; the callable-only stub would reject valid calls.
+            return Some(self.heap.mk_any_explicit());
+        }
+        Some(self.inspect_unwrapped_type(&ty, arg.range(), &mut SmallSet::new(), false))
+    }
+
+    /// Follow each wrapped chain independently, retaining uncertainty about hidden attributes.
+    fn inspect_unwrapped_type(
+        &self,
+        ty: &Type,
+        range: TextRange,
+        seen: &mut SmallSet<Type>,
+        followed_wrapped: bool,
+    ) -> Type {
+        const MAX_WRAPPED_DEPTH: usize = 32;
+        self.distribute_over_union(ty, |ty| {
+            // Recursive class annotations can change type arguments at every wrapped edge.
+            if seen.len() >= MAX_WRAPPED_DEPTH
+                || matches!(ty, Type::ClassType(cls) if seen.iter().any(|previous| {
+                    matches!(previous, Type::ClassType(previous) if previous.class_object() == cls.class_object())
+                }))
+                || !seen.insert(ty.clone())
+            {
+                return self.heap.mk_any_explicit();
+            }
+            let wrapped_attr = Name::new_static("__wrapped__");
+            let result = if !self.has_attr(ty, &wrapped_attr) {
+                // A callable annotation or an in-place mutation can hide `__wrapped__`.
+                // Preserve only a terminal function reached through a known wrapped edge.
+                if followed_wrapped && ty.toplevel_func_metadata().is_some() {
+                    ty.clone()
+                } else {
+                    self.heap.mk_any_explicit()
+                }
+            } else {
+                let attr_errors = self.error_swallower();
+                let next = self.type_of_attr_get(
+                    ty,
+                    &wrapped_attr,
+                    range,
+                    &attr_errors,
+                    ErrorKind::MissingAttribute,
+                    None,
+                    "__wrapped__ lookup for inspect.unwrap",
+                );
+                if attr_errors.is_empty() {
+                    self.inspect_unwrapped_type(&next, range, seen, true)
+                } else {
+                    self.heap.mk_any_explicit()
+                }
+            };
+            seen.shift_remove(ty);
+            result
+        })
     }
 
     pub fn freeform_call_infer(

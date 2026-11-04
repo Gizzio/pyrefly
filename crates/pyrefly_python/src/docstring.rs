@@ -70,6 +70,14 @@ impl Docstring {
     pub fn resolve(&self) -> String {
         Self::clean(self.1.code_at(self.0))
     }
+
+    /// Whether the literal contains non-whitespace text, before Markdown rendering.
+    ///
+    /// `resolve` turns leftover spaces into `&nbsp;`, so a whitespace-only
+    /// docstring looks nonempty after rendering.
+    pub fn has_content(&self) -> bool {
+        !normalize_literal(self.1.code_at(self.0)).trim().is_empty()
+    }
 }
 
 /// Render cleaned docstring lines into markdown, adding fences for code blocks.
@@ -483,32 +491,34 @@ where
         .unwrap_or(0)
 }
 
-/// Persist the documentation collected so far for the current parameter.
+/// Persist the documentation collected so far for the current parameters.
 fn commit_parameter_doc(
-    current_param: &mut Option<String>,
+    current_params: &mut Vec<String>,
     current_lines: &mut Vec<String>,
     docs: &mut HashMap<String, String>,
 ) {
-    if let Some(name) = current_param.take() {
-        let content = current_lines.join("\n").trim().to_owned();
-        current_lines.clear();
-        if !content.is_empty() {
-            docs.entry(name).or_insert(content);
-        }
+    let content = current_lines.join("\n").trim().to_owned();
+    current_lines.clear();
+    if content.is_empty() {
+        current_params.clear();
+        return;
+    }
+    for name in current_params.drain(..) {
+        docs.entry(name).or_insert_with(|| content.clone());
     }
 }
 
 /// Parse [`Sphinx`](https://www.sphinx-doc.org/en/master/usage/extensions/napoleon.html)
 /// style `:param foo: description` blocks into a map of parameter docs.
 fn parse_sphinx_params(lines: &[String], docs: &mut HashMap<String, String>) {
-    let mut current_param = None;
+    let mut current_params = Vec::new();
     let mut current_lines = Vec::new();
     let mut base_indent = 0usize;
 
     for line in lines {
         let trimmed = line.trim_start();
         if trimmed.starts_with(":param") {
-            commit_parameter_doc(&mut current_param, &mut current_lines, docs);
+            commit_parameter_doc(&mut current_params, &mut current_lines, docs);
 
             let rest = trimmed.trim_start_matches(":param").trim_start();
             let (name_part, desc_part) = match rest.split_once(':') {
@@ -528,8 +538,7 @@ fn parse_sphinx_params(lines: &[String], docs: &mut HashMap<String, String>) {
                 continue;
             }
             base_indent = leading_space_count(line);
-            current_param = Some(name);
-            current_lines.clear();
+            current_params = vec![name];
             let desc = desc_part.trim_start();
             if !desc.is_empty() {
                 current_lines.push(desc.to_owned());
@@ -538,25 +547,25 @@ fn parse_sphinx_params(lines: &[String], docs: &mut HashMap<String, String>) {
         }
 
         if trimmed.starts_with(':') {
-            commit_parameter_doc(&mut current_param, &mut current_lines, docs);
+            commit_parameter_doc(&mut current_params, &mut current_lines, docs);
             continue;
         }
 
-        if current_param.is_some() {
+        if !current_params.is_empty() {
             if trimmed.is_empty() {
-                commit_parameter_doc(&mut current_param, &mut current_lines, docs);
+                commit_parameter_doc(&mut current_params, &mut current_lines, docs);
                 continue;
             }
             let indent = leading_space_count(line);
             if indent > base_indent {
                 current_lines.push(line.trim_start().to_owned());
             } else {
-                commit_parameter_doc(&mut current_param, &mut current_lines, docs);
+                commit_parameter_doc(&mut current_params, &mut current_lines, docs);
             }
         }
     }
 
-    commit_parameter_doc(&mut current_param, &mut current_lines, docs);
+    commit_parameter_doc(&mut current_params, &mut current_lines, docs);
 }
 
 fn is_google_section(header: &str) -> bool {
@@ -594,7 +603,7 @@ fn extract_google_param_name(header: &str) -> Option<String> {
 fn parse_google_params(lines: &[String], docs: &mut HashMap<String, String>) {
     let mut in_section = false;
     let mut section_indent = 0usize;
-    let mut current_param = None;
+    let mut current_params = Vec::new();
     let mut current_lines = Vec::new();
     let mut param_indent = 0usize;
 
@@ -603,24 +612,24 @@ fn parse_google_params(lines: &[String], docs: &mut HashMap<String, String>) {
         let trimmed = line.trim();
 
         if trimmed.is_empty() {
-            commit_parameter_doc(&mut current_param, &mut current_lines, docs);
+            commit_parameter_doc(&mut current_params, &mut current_lines, docs);
             continue;
         }
 
         if trimmed.ends_with(':') {
             let header = trimmed.trim_end_matches(':');
             if is_google_section(header) {
-                commit_parameter_doc(&mut current_param, &mut current_lines, docs);
+                commit_parameter_doc(&mut current_params, &mut current_lines, docs);
                 in_section = true;
                 section_indent = indent;
                 continue;
             }
             if in_section && indent <= section_indent {
-                commit_parameter_doc(&mut current_param, &mut current_lines, docs);
+                commit_parameter_doc(&mut current_params, &mut current_lines, docs);
                 in_section = false;
             }
         } else if in_section && indent <= section_indent {
-            commit_parameter_doc(&mut current_param, &mut current_lines, docs);
+            commit_parameter_doc(&mut current_params, &mut current_lines, docs);
             in_section = false;
         }
 
@@ -629,7 +638,7 @@ fn parse_google_params(lines: &[String], docs: &mut HashMap<String, String>) {
         }
 
         if indent <= section_indent {
-            commit_parameter_doc(&mut current_param, &mut current_lines, docs);
+            commit_parameter_doc(&mut current_params, &mut current_lines, docs);
             in_section = false;
             continue;
         }
@@ -638,9 +647,8 @@ fn parse_google_params(lines: &[String], docs: &mut HashMap<String, String>) {
         if let Some((header, rest)) = content.split_once(':')
             && let Some(name) = extract_google_param_name(header.trim())
         {
-            commit_parameter_doc(&mut current_param, &mut current_lines, docs);
-            current_param = Some(name);
-            current_lines.clear();
+            commit_parameter_doc(&mut current_params, &mut current_lines, docs);
+            current_params = vec![name];
             param_indent = indent;
             let desc = rest.trim_start();
             if !desc.is_empty() {
@@ -649,21 +657,122 @@ fn parse_google_params(lines: &[String], docs: &mut HashMap<String, String>) {
             continue;
         }
 
-        if current_param.is_some() {
+        if !current_params.is_empty() {
             if indent > param_indent {
                 current_lines.push(content.trim_start().to_owned());
             } else {
-                commit_parameter_doc(&mut current_param, &mut current_lines, docs);
+                commit_parameter_doc(&mut current_params, &mut current_lines, docs);
             }
         }
     }
 
-    commit_parameter_doc(&mut current_param, &mut current_lines, docs);
+    commit_parameter_doc(&mut current_params, &mut current_lines, docs);
+}
+
+/// Return true if `line` is the dashed underline of a numpydoc section header.
+fn is_numpydoc_underline(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.len() >= 3 && trimmed.bytes().all(|byte| byte == b'-')
+}
+
+fn is_numpydoc_section(header: &str) -> bool {
+    matches!(header, "Parameters" | "Other Parameters")
+}
+
+/// Extract the names from a numpydoc parameter declaration such as
+/// `x, y : int` or `*args`. The type is optional.
+fn extract_numpydoc_param_names(line: &str) -> Option<Vec<String>> {
+    let names = line.split_once(':').map_or(line, |(names, _)| names);
+    let names = names
+        .split(',')
+        .map(|name| name.trim().trim_matches('`').trim_start_matches('*'))
+        .filter(|name| {
+            let mut chars = name.chars();
+            chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+                && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    (!names.is_empty()).then_some(names)
+}
+
+/// Parse numpydoc-style `Parameters` sections of the form:
+///
+/// ```text
+/// Parameters
+/// ----------
+/// foo : int
+///     Description of foo.
+/// bar, baz : str
+///     Description of bar and baz.
+/// ```
+///
+/// See <https://numpydoc.readthedocs.io/en/latest/format.html#parameters>.
+fn parse_numpydoc_params(lines: &[String], docs: &mut HashMap<String, String>) {
+    let mut in_section = false;
+    let mut section_indent = 0usize;
+    let mut current_params = Vec::new();
+    let mut current_lines = Vec::new();
+    let mut param_indent = 0usize;
+
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let indent = leading_space_count(line);
+
+        // Within a parameter section, deeper-indented headings belong to descriptions.
+        if !trimmed.is_empty()
+            && (!in_section || indent <= section_indent)
+            && lines.get(index + 1).is_some_and(|next| {
+                leading_space_count(next) == indent && is_numpydoc_underline(next)
+            })
+        {
+            commit_parameter_doc(&mut current_params, &mut current_lines, docs);
+            in_section = is_numpydoc_section(trimmed);
+            section_indent = indent;
+            continue;
+        }
+
+        if indent == section_indent && is_numpydoc_underline(line) {
+            continue;
+        }
+
+        if !in_section {
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            if !current_params.is_empty()
+                && current_lines.last().is_some_and(|line| !line.is_empty())
+            {
+                current_lines.push(String::new());
+            }
+            continue;
+        }
+
+        if let Some(names) = extract_numpydoc_param_names(trimmed)
+            && (current_params.is_empty() || indent <= param_indent)
+        {
+            commit_parameter_doc(&mut current_params, &mut current_lines, docs);
+            current_params = names;
+            param_indent = indent;
+            continue;
+        }
+
+        if !current_params.is_empty() {
+            if indent > param_indent {
+                current_lines.push(trimmed.to_owned());
+            } else {
+                commit_parameter_doc(&mut current_params, &mut current_lines, docs);
+            }
+        }
+    }
+
+    commit_parameter_doc(&mut current_params, &mut current_lines, docs);
 }
 
 /// Extract a map of `parameter -> markdown` documentation snippets from the
-/// supplied docstring, supporting both Sphinx (`:param foo:`) and
-/// Google-style (`Args:`) formats.
+/// supplied docstring, supporting Sphinx (`:param foo:`), Google-style
+/// (`Args:`), and numpydoc (`Parameters`) formats.
 pub fn parse_parameter_documentation(docstring: &str) -> HashMap<String, String> {
     let lines = dedented_lines_for_parsing(docstring);
     let mut docs = HashMap::new();
@@ -672,7 +781,56 @@ pub fn parse_parameter_documentation(docstring: &str) -> HashMap<String, String>
     }
     parse_sphinx_params(&lines, &mut docs);
     parse_google_params(&lines, &mut docs);
+    parse_numpydoc_params(&lines, &mut docs);
     docs
+}
+
+/// A parameter type written in a Sphinx field of a docstring.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DocstringParamType<'a> {
+    /// The type as written, for example `flask.Flask|flask.Blueprint`.
+    pub type_text: &'a str,
+    /// The byte offset of `type_text` within the docstring it was parsed from.
+    pub offset: usize,
+}
+
+/// Extract the parameter types declared by Sphinx fields, keyed by parameter name. Both
+/// `:param <type> <name>:` and `:type <name>: <type>` are recognized, and the latter wins
+/// when a parameter has both.
+///
+/// `docstring` is used as written, so `offset` can be mapped back to the source file.
+///
+/// See <https://www.sphinx-doc.org/en/master/usage/domains/python.html#info-field-lists>.
+pub fn parse_sphinx_param_types(docstring: &str) -> HashMap<&str, DocstringParamType<'_>> {
+    let mut types = HashMap::new();
+    for line in docstring.lines() {
+        let Some((head, body)) = line
+            .trim_start()
+            .strip_prefix(':')
+            .and_then(|x| x.split_once(':'))
+        else {
+            continue;
+        };
+        let (field, args) = head.split_once(char::is_whitespace).unwrap_or((head, ""));
+        let args = args.trim();
+        let (name, type_text) = match field {
+            "param" | "parameter" | "arg" | "argument" => {
+                match args.rsplit_once(char::is_whitespace) {
+                    Some((type_text, name)) => (name, type_text.trim()),
+                    None => continue,
+                }
+            }
+            "type" => (args, body.trim()),
+            _ => continue,
+        };
+        if type_text.is_empty() || (field != "type" && types.contains_key(name)) {
+            continue;
+        }
+        // Both slices borrow from `docstring`, so their distance is the byte offset.
+        let offset = type_text.as_ptr() as usize - docstring.as_ptr() as usize;
+        types.insert(name, DocstringParamType { type_text, offset });
+    }
+    types
 }
 
 #[cfg(test)]
@@ -683,6 +841,7 @@ mod tests {
     use crate::docstring::Docstring;
     use crate::docstring::DocstringRenderState;
     use crate::docstring::parse_parameter_documentation;
+    use crate::docstring::parse_sphinx_param_types;
 
     #[test]
     fn test_clean_removes_double_multiline_double_quotes() {
@@ -1246,5 +1405,302 @@ Args:
         let docs = parse_parameter_documentation(doc);
         assert_eq!(docs.get("foo").unwrap(), "dict param");
         assert_eq!(docs.get("bar").unwrap(), "tuple param");
+    }
+
+    #[test]
+    fn test_parse_numpydoc_param_docs() {
+        let doc = r#"
+Parameters
+----------
+foo : int
+    first line
+    second line
+bar : str
+    another
+"#;
+        let docs = parse_parameter_documentation(doc);
+        assert_eq!(docs.get("foo").unwrap(), "first line\nsecond line");
+        assert_eq!(docs.get("bar").unwrap(), "another");
+    }
+
+    #[test]
+    fn test_parse_numpydoc_multiple_names_and_varargs() {
+        let doc = r#"
+Parameters
+----------
+foo, bar : int
+    shared description
+*args : tuple
+    positional arguments
+**kwargs : dict
+    keyword arguments
+"#;
+        let docs = parse_parameter_documentation(doc);
+        assert_eq!(docs.get("foo").unwrap(), "shared description");
+        assert_eq!(docs.get("bar").unwrap(), "shared description");
+        assert_eq!(docs.get("args").unwrap(), "positional arguments");
+        assert_eq!(docs.get("kwargs").unwrap(), "keyword arguments");
+    }
+
+    #[test]
+    fn test_parse_numpydoc_other_parameters_and_section_end() {
+        let doc = r#"
+Parameters
+----------
+foo : int
+    foo description
+
+Other Parameters
+----------------
+bar : str
+    bar description
+
+Returns
+-------
+int
+    the return value
+"#;
+        let docs = parse_parameter_documentation(doc);
+        assert_eq!(docs.get("foo").unwrap(), "foo description");
+        assert_eq!(docs.get("bar").unwrap(), "bar description");
+        assert_eq!(docs.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_numpydoc_indented_in_docstring() {
+        let doc = r#"""
+    Summary.
+
+    Parameters
+    ----------
+    foo : int
+        first line
+        second line
+    """#;
+        let docs = parse_parameter_documentation(doc);
+        assert_eq!(docs.get("foo").unwrap(), "first line\nsecond line");
+    }
+
+    #[test]
+    fn test_parse_numpydoc_type_with_default() {
+        let doc = r#"
+Parameters
+----------
+foo, bar : int, default: 1
+    shared description
+baz : Dict[str, int]
+    complex type
+"#;
+        let docs = parse_parameter_documentation(doc);
+        assert_eq!(docs.get("foo").unwrap(), "shared description");
+        assert_eq!(docs.get("bar").unwrap(), "shared description");
+        assert_eq!(docs.get("baz").unwrap(), "complex type");
+    }
+
+    #[test]
+    fn test_parse_numpydoc_without_description_is_ignored() {
+        let doc = r#"
+Parameters
+----------
+foo : int
+bar : str
+    bar description
+"#;
+        let docs = parse_parameter_documentation(doc);
+        assert_eq!(docs.get("foo"), None);
+        assert_eq!(docs.get("bar").unwrap(), "bar description");
+    }
+
+    #[test]
+    fn test_parse_numpydoc_untyped_params() {
+        let doc = r#"
+Parameters
+----------
+foo, bar
+    shared description
+*args
+    positional arguments
+**kwargs
+    keyword arguments
+"#;
+        let docs = parse_parameter_documentation(doc);
+        assert_eq!(docs.get("foo").unwrap(), "shared description");
+        assert_eq!(docs.get("bar").unwrap(), "shared description");
+        assert_eq!(docs.get("args").unwrap(), "positional arguments");
+        assert_eq!(docs.get("kwargs").unwrap(), "keyword arguments");
+    }
+
+    #[test]
+    fn test_parse_numpydoc_preserves_multiple_paragraphs() {
+        let doc = r#"
+Parameters
+----------
+foo : int
+    First paragraph.
+
+    Second paragraph.
+bar : str
+    another
+"#;
+        let docs = parse_parameter_documentation(doc);
+        assert_eq!(
+            docs.get("foo").unwrap(),
+            "First paragraph.\n\nSecond paragraph."
+        );
+        assert_eq!(docs.get("bar").unwrap(), "another");
+    }
+
+    #[test]
+    fn test_parse_numpydoc_literal_dashes() {
+        let doc = r#"
+Summary.
+
+    Parameters
+    ----------
+    separator : str
+        Example separator::
+
+            ----
+
+        Used between records.
+    count : int
+        Number of records.
+"#;
+        let docs = parse_parameter_documentation(doc);
+        assert_eq!(
+            docs.get("separator").unwrap(),
+            "Example separator::\n\n----\n\nUsed between records."
+        );
+        assert_eq!(docs.get("count").unwrap(), "Number of records.");
+    }
+
+    #[test]
+    fn test_parse_numpydoc_nested_heading() {
+        let doc = r#"
+Parameters
+----------
+separator : str
+    First paragraph.
+
+    Details
+    -------
+    Used between records.
+count : int
+    Number of records.
+"#;
+        let docs = parse_parameter_documentation(doc);
+        assert_eq!(
+            docs.get("separator").unwrap(),
+            "First paragraph.\n\nDetails\n-------\nUsed between records."
+        );
+        assert_eq!(docs.get("count").unwrap(), "Number of records.");
+    }
+
+    #[test]
+    fn test_parse_numpydoc_misaligned_underline() {
+        let doc = r#"
+Parameters
+    ----------
+separator : str
+    Used between records.
+"#;
+        let docs = parse_parameter_documentation(doc);
+        assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_numpydoc_indented_section_boundary() {
+        let doc = r#"
+Summary.
+
+    Parameters
+    ----------
+    separator : str
+        Used between records.
+
+    Other Parameters
+    ----------------
+    count : int
+        Number of records.
+
+    Returns
+    -------
+    result : str
+        Joined records.
+"#;
+        let docs = parse_parameter_documentation(doc);
+        assert_eq!(docs.get("separator").unwrap(), "Used between records.");
+        assert_eq!(docs.get("count").unwrap(), "Number of records.");
+        assert_eq!(docs.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_numpydoc_dedented_section_boundary() {
+        let doc = r#"
+Notes
+-----
+    Parameters
+    ----------
+    separator : str
+        Used between records.
+
+Returns
+-------
+result : str
+    Joined records.
+"#;
+        let docs = parse_parameter_documentation(doc);
+        assert_eq!(docs.get("separator").unwrap(), "Used between records.");
+        assert_eq!(docs.len(), 1);
+    }
+
+    fn param_types(docstring: &str) -> Vec<(String, String)> {
+        let types = parse_sphinx_param_types(docstring);
+        for x in types.values() {
+            assert_eq!(
+                &docstring[x.offset..x.offset + x.type_text.len()],
+                x.type_text
+            );
+        }
+        let mut types = types
+            .iter()
+            .map(|(name, x)| (name.to_string(), x.type_text.to_owned()))
+            .collect::<Vec<_>>();
+        types.sort();
+        types
+    }
+
+    fn expected(types: &[(&str, &str)]) -> Vec<(String, String)> {
+        types
+            .iter()
+            .map(|(name, ty)| (name.to_string(), ty.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_parse_sphinx_param_types() {
+        let doc = "Summary.\n\n    :param str name: the name\n    :param flask.Flask|flask.Blueprint app: app\n    :param untyped: no type\n    :type count: int\n    :returns: nothing\n";
+        assert_eq!(
+            param_types(doc),
+            expected(&[
+                ("app", "flask.Flask|flask.Blueprint"),
+                ("count", "int"),
+                ("name", "str"),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_sphinx_param_types_type_field_wins() {
+        let doc = ":type x: bytes\n:param str x: a\n";
+        assert_eq!(param_types(doc), expected(&[("x", "bytes")]));
+        let doc = ":param str x: a\n:type x: bytes\n";
+        assert_eq!(param_types(doc), expected(&[("x", "bytes")]));
+    }
+
+    #[test]
+    fn test_parse_sphinx_param_types_ignores_prose() {
+        let doc = "Summary : with a colon.\n\nSee also: nothing (really): at all.\n:returns: x\n";
+        assert_eq!(param_types(doc), expected(&[]));
     }
 }

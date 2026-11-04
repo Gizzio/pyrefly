@@ -15,6 +15,7 @@ use ruff_python_ast::name::Name;
 #[derive(Debug, Clone, Dupe, Copy, PartialEq, Eq)]
 pub enum SpecialExport {
     ClassMethod,
+    StaticMethod,
     AbstractClassMethod,
     TypeAlias,
     TypeAliasType,
@@ -43,9 +44,12 @@ pub enum SpecialExport {
     Quit,
     OsExit,
     Len,
+    Any,
+    All,
     Range,
     Bool,
     BuiltinsType,
+    BuiltinsObject,
     TypingType,
     NoTypeCheck,
     NotImplemented,
@@ -56,11 +60,14 @@ pub enum SpecialExport {
     Generic,
     Protocol,
     PydanticConfigDict,
+    PydanticFieldValidator,
+    PydanticModelValidator,
     PydanticToCamel,
     PydanticToPascal,
     PydanticToSnake,
     HasAttr,
     GetAttr,
+    SetAttr,
     Callable,
     BuiltinsDict,
     TypingDict,
@@ -94,6 +101,8 @@ pub enum SpecialExport {
     AttrsLegacyAttrib,
     AttrsNextGenField,
     AttrsNothing,
+    FunctoolsWraps,
+    FunctoolsUpdateWrapper,
 }
 
 impl SpecialExport {
@@ -101,6 +110,7 @@ impl SpecialExport {
         match name.as_str() {
             "TypeAlias" => Some(Self::TypeAlias),
             "classmethod" => Some(Self::ClassMethod),
+            "staticmethod" => Some(Self::StaticMethod),
             "abstractclassmethod" => Some(Self::AbstractClassMethod),
             "TypeVar" => Some(Self::TypeVar),
             "IntVar" => Some(Self::IntVar),
@@ -131,6 +141,8 @@ impl SpecialExport {
             "quit" => Some(Self::Quit),
             "_exit" => Some(Self::OsExit),
             "len" => Some(Self::Len),
+            "any" => Some(Self::Any),
+            "all" => Some(Self::All),
             "range" => Some(Self::Range),
             "bool" => Some(Self::Bool),
             "type" => Some(Self::BuiltinsType),
@@ -142,11 +154,15 @@ impl SpecialExport {
             "override" => Some(Self::Override),
             "abstractmethod" => Some(Self::AbstractMethod),
             "ConfigDict" => Some(Self::PydanticConfigDict),
+            "field_validator" => Some(Self::PydanticFieldValidator),
+            "model_validator" => Some(Self::PydanticModelValidator),
             "to_camel" => Some(Self::PydanticToCamel),
             "to_pascal" => Some(Self::PydanticToPascal),
             "to_snake" => Some(Self::PydanticToSnake),
             "hasattr" => Some(Self::HasAttr),
             "getattr" => Some(Self::GetAttr),
+            "setattr" => Some(Self::SetAttr),
+            "object" => Some(Self::BuiltinsObject),
             "TypeAliasType" => Some(Self::TypeAliasType),
             "Callable" => Some(Self::Callable),
             "dict" => Some(Self::BuiltinsDict),
@@ -179,6 +195,8 @@ impl SpecialExport {
             "attr" | "attrib" | "ib" => Some(Self::AttrsLegacyAttrib),
             "field" => Some(Self::AttrsNextGenField),
             "NOTHING" => Some(Self::AttrsNothing),
+            "wraps" => Some(Self::FunctoolsWraps),
+            "update_wrapper" => Some(Self::FunctoolsUpdateWrapper),
             _ => None,
         }
     }
@@ -223,16 +241,22 @@ impl SpecialExport {
                 matches!(m.as_str(), "typing" | "typing_extensions")
             }
             Self::CollectionsNamedTuple => matches!(m.as_str(), "collections"),
+            Self::FunctoolsWraps | Self::FunctoolsUpdateWrapper => m == ModuleName::functools(),
             Self::Enum | Self::StrEnum | Self::IntEnum => matches!(m.as_str(), "enum"),
             Self::Super
             | Self::Len
+            | Self::Any
+            | Self::All
             | Self::Range
             | Self::Quit
             | Self::Bool
             | Self::BuiltinsType
+            | Self::BuiltinsObject
             | Self::HasAttr
             | Self::GetAttr
+            | Self::SetAttr
             | Self::ClassMethod
+            | Self::StaticMethod
             | Self::BuiltinsDict
             | Self::BuiltinsList
             | Self::NotImplemented
@@ -250,7 +274,10 @@ impl SpecialExport {
             Self::Exit => matches!(m.as_str(), "sys" | "builtins"),
             Self::OsExit => matches!(m.as_str(), "os"),
             Self::AbstractMethod | Self::AbstractClassMethod => matches!(m.as_str(), "abc"),
-            Self::PydanticConfigDict => matches!(m.as_str(), "pydantic"),
+            Self::PydanticConfigDict => matches!(m.as_str(), "pydantic" | "pydantic.config"),
+            Self::PydanticFieldValidator | Self::PydanticModelValidator => {
+                matches!(m.as_str(), "pydantic" | "pydantic.functional_validators")
+            }
             Self::PydanticToCamel | Self::PydanticToPascal | Self::PydanticToSnake => {
                 m == ModuleName::pydantic_alias_generators()
             }
